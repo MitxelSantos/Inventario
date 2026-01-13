@@ -1,0 +1,131 @@
+# ============================================================================
+# SISTEMA DE INVENTARIO TECNOLÓGICO - Hospital Alfonso Jaramillo Salazar
+# ============================================================================
+# Versión: 1.0
+# Fecha: Diciembre 2025
+# Python: 3.8+
+# Sistema Operativo: Windows 10/11 (recomendado para detección completa)
+# ============================================================================
+
+# ============================================================================
+# DEPENDENCIAS OBLIGATORIAS
+# ============================================================================
+
+# Interfaz Gráfica Moderna
+customtkinter>=5.2.0
+# CustomTkinter proporciona una interfaz moderna y atractiva
+# con widgets personalizables y temas light/dark
+
+# Manejo de Archivos Excel
+openpyxl>=3.1.2
+# Lectura y escritura de archivos .xlsx
+# Esencial para la gestión del inventario
+
+# Procesamiento de Imágenes (Logo)
+pillow>=10.0.0
+# Permite cargar y mostrar el logo del hospital
+# Requerido para PIL/Image
+
+# ============================================================================
+# DEPENDENCIAS OPCIONALES (WINDOWS)
+# ============================================================================
+
+# Detección de Hardware (WMI)
+WMI>=1.5.1; sys_platform == 'win32'
+# Detecta: Marca, Modelo, Serial, Tipo de Disco
+# Detecta discos primario Y secundario
+# CRÍTICO para detección automática completa
+
+# Información del Sistema
+psutil>=5.9.0
+# Detecta: RAM, Almacenamiento, Procesos
+# Mejora la detección automática
+
+# Acceso al Registro de Windows
+pywin32>=306; sys_platform == 'win32'
+# Detecta: Licencias de Windows, Office
+# Información de software instalado
+
+# ============================================================================
+# NOTAS DE INSTALACIÓN
+# ============================================================================
+
+# INSTALACIÓN BÁSICA (Funcionalidad limitada):
+#   pip install customtkinter openpyxl pillow
+#
+# INSTALACIÓN COMPLETA (Recomendada - Windows):
+#   pip install -r requirements.txt
+#
+# INSTALACIÓN INDIVIDUAL:
+#   pip install customtkinter
+#   pip install openpyxl
+#   pip install pillow
+#   pip install WMI          # Solo Windows
+#   pip install psutil
+#   pip install pywin32      # Solo Windows
+#
+# ACTUALIZAR TODAS LAS DEPENDENCIAS:
+#   pip install -r requirements.txt --upgrade
+#
+# REINSTALAR DEPENDENCIAS:
+#   pip install -r requirements.txt --force-reinstall
+
+# ============================================================================
+# FUNCIONALIDAD SIN DEPENDENCIAS OPCIONALES
+# ============================================================================
+
+# SIN WMI:
+#   - NO detecta: Marca, Modelo, Serial del equipo
+#   - NO detecta: Tipo de disco (HDD/SSD)
+#   - NO detecta: Disco secundario
+#   - Todos los campos de hardware quedarán como "No detectado"
+
+# SIN psutil:
+#   - NO detecta: RAM instalada
+#   - NO detecta: Capacidad de almacenamiento
+#   - Campos relacionados quedarán como "Requiere psutil"
+
+# SIN pywin32:
+#   - NO detecta: Licencias de Windows
+#   - NO detecta: Versión de Office instalada
+#   - Detección de software limitada
+
+# ============================================================================
+# COMPATIBILIDAD
+# ============================================================================
+
+# PROBADO EN:
+#   - Windows 10 (64-bit)
+#   - Windows 11 (64-bit)
+#   - Python 3.8, 3.9, 3.10, 3.11, 3.12
+#
+# NO COMPATIBLE CON:
+#   - Linux (WMI no disponible - detección limitada)
+#   - macOS (WMI no disponible - detección limitada)
+#   - Python < 3.8
+
+# ============================================================================
+# NUEVAS CARACTERÍSTICAS EN ESTA VERSIÓN
+# ============================================================================
+
+# ✅ Detección de disco secundario (WMI)
+# ✅ Menú superior moderno y desplegable
+# ✅ Carga automática de Excel sin confirmación
+# ✅ Optimización de código con funciones reutilizables
+# ✅ Mantenimientos sin campo de costo
+# ✅ Todos los códigos a 4 dígitos (E-, IMP-, PER-, RED-)
+
+# ============================================================================
+# SOPORTE
+# ============================================================================
+
+# Para problemas con la instalación:
+# 1. Actualizar pip: python -m pip install --upgrade pip
+# 2. Instalar wheel: pip install wheel
+# 3. Intentar instalación de nuevo
+
+# Para errores específicos de Windows:
+# - Instalar Microsoft Visual C++ Redistributable
+# - Ejecutar como Administrador
+
+# ============================================================================
