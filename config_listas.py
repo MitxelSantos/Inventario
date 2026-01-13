@@ -52,26 +52,148 @@ AREAS_SERVICIO = [
 # Alias para compatibilidad
 AREAS_SERVICIOS = AREAS_SERVICIO
 
-MACRO_PRO = ["ESTRATÉGICO", "MISIONAL", "APOYO", "EVALUACIÓN Y CONTROL"]
+# ============================================================================
+# ESTRUCTURA JERÁRQUICA: MACROPROCESO → PROCESO → SUBPROCESO
+# ============================================================================
 
-PROCESO_EST = ["Gerencia", "Planeación y calidad"]
+MACROPROCESOS = {
+    "ESTRATÉGICO": {
+        "GERENCIA": [
+            "Direccionamiento Estratégico",
+            "Asignación de Recursos",
+            "Evaluación y Desempeño Institucional",
+            "Rendición de Cuentas",
+            "Asesoria Juridica"
+        ],
+        "PLANEACIÓN Y CALIDAD": [
+            "Seguridad del Paciente",
+            "Epidemiologia",
+            "Estadistica",
+            "Formulación y Seguimientos de Planes, Programas y Proyectos",
+            "Revisión Documental",
+            "Productos no Conformes"
+        ]
+    },
+    "MISIONAL": {
+        "AMBULATORIA": [
+            "Consulta Externa",
+            "Optometria",
+            "Promoción y mantenimiento de la Salud RIAS-MAITE",
+            "Odontologia",
+            "Atención al paciente hospitalizado (2,4 y 5 piso; UCI)",
+            "Atención Quirúrgica (Quirófano)"
+        ],
+        "SOPORTE DIAGNÓSTICO Y TERAPÉUTICO": [
+            "Fisioterapia",
+            "Laboratorio Clínico",
+            "Servicio Farmacéutico",
+            "Psicologia",
+            "Trabajo Social",
+            "Imágenes Diagnósticas"
+        ],
+        "URGENCIAS": [
+            "Atención de Urgencias",
+            "Referencia y Contrarreferencia"
+        ],
+        "COORDINACIÓN ASISTENCIAL": [
+            "Actualización mantenimiento y evaluación a la adherencia de GPC",
+            "Evaluación y seguimiento al equipo médico asistencial"
+        ]
+    },
+    "APOYO": {
+        "CONTRATACIÓN": [
+            "Contractual",
+            "Comercial"
+        ],
+        "TALENTO HUMANO": [
+            "Seguridad y Salud en el Trabajo",
+            "Talento Humano",
+            "Docencia e Investigación"
+        ],
+        "FINANCIERA": [
+            "Presupuesto",
+            "Cartera",
+            "Contabilidad",
+            "Tesorería/Pagaduría",
+            "Facturación"
+        ],
+        "INFORMACIÓN Y COMUNICACIONES": [
+            "Sistemas de Información",
+            "SIAU",
+            "Archivo y Gestión Documental"
+        ],
+        "AMBIENTE FÍSICO Y TECNOLOGÍA": [
+            "Almacén",
+            "Lavandería",
+            "Alimentación",
+            "Vigilancia",
+            "Mantenimiento",
+            "Servicios Generales"
+        ]
+    },
+    "EVALUACIÓN Y CONTROL": {
+        "CONTROL INTERNO": [
+            "Seguimiento y Evaluación de Planes y Programas"
+        ],
+        "AUDITORIA MEDICA": [
+            "Concurrencia",
+            "Glosas y Devoluciones"
+        ]
+    }
+}
 
-PROCESO_MIS = ["Ambulatoria","Soporte diagnostico y terapeutico", "Urgencias", "Coordinación asistencial"]
+# Listas para los combobox principales
+LISTA_MACROPROCESOS = list(MACROPROCESOS.keys())
 
-PROCESO_APO = ["Contratación", "Talento humano", "Financiera", "Información y comunicaciones", "Ambiente fisico y tecnologia"]
+def get_procesos_por_macroproceso(macroproceso):
+    """Retorna lista de procesos para un macroproceso dado."""
+    if macroproceso in MACROPROCESOS:
+        return list(MACROPROCESOS[macroproceso].keys())
+    return []
 
-PROCESO_EYC = ["Control interno", "Auditoria medica"]
+def get_subprocesos_por_proceso(macroproceso, proceso):
+    """Retorna lista de subprocesos para un macroproceso y proceso dados."""
+    if macroproceso in MACROPROCESOS:
+        if proceso in MACROPROCESOS[macroproceso]:
+            return MACROPROCESOS[macroproceso][proceso]
+    return []
 
-SUBPRO_GER = ["Direccionamiento estrategico", "Asignación de recursos", "Evaluación y desempeño institucional", 
-              "Rendición de cuentas", "Asesoria juridica"]
+# ============================================================================
+# CUESTIONARIO DE CLASIFICACIÓN (18 PREGUNTAS SÍ/NO)
+# ============================================================================
 
-SUBPRO_PYC = ["Seguridad del paciente", "Epidemiologia", "Estadistica", "Formulación y seguimientos de planes, programas y proyectos",
-              "Revision documental", "Productos no conformes"]
+# 9 preguntas de CONFIDENCIALIDAD (tipo de información)
+PREGUNTAS_CONFIDENCIALIDAD = [
+    "¿El activo contiene información pública de la entidad?",
+    "¿El activo contiene información interna o de uso restringido?",
+    "¿El activo contiene datos de identidad de clientes o trabajadores?",
+    "¿El activo contiene datos de contacto de clientes o trabajadores?",
+    "¿El activo contiene información técnica confidencial de TI?",
+    "¿El activo contiene datos personales sensibles?",
+    "¿El activo contiene datos financieros o de nómina?",
+    "¿El activo contiene información secreta (contraseñas, claves)?",
+    "¿El activo contiene información confidencial de negocio?"
+]
 
-SUBPRO_AMB = ["Consulta externa", "Optometria", "Promoción y mantenimiento de la salud", "RIAS-MAITE", "Odontologia",
-              "Atención al paciente hospitalizado", "Atención quirurgica"]
+# 3 preguntas de INTEGRIDAD (compromiso de información)
+PREGUNTAS_INTEGRIDAD = [
+    "Si el activo se ve comprometido, ¿podría la persistencia de la información verse afectada?",
+    "Si el activo se ve comprometido, ¿podría la información en tránsito verse afectada?",
+    "Si el activo se ve comprometido, ¿podría la información en proceso ser afectada?"
+]
 
-SUBPRO_SDT = ["Fisioterapia", "Laboratorio clinico", "Servicio Famarceutico", "Psicologia", "Trabajo Social", "Imagenes diagnosticas"]
+# 6 preguntas de CRITICIDAD (impacto operacional)
+PREGUNTAS_CRITICIDAD = [
+    "¿La indisponibilidad del activo afectaría a los trabajadores en su operación diaria?",
+    "¿La indisponibilidad del activo afectaría a usuarios externos?",
+    "Si el activo se encuentra indisponible, ¿se vería afectada la operación principal (misional)?",
+    "¿La indisponibilidad del activo afectaría procesos de soporte clave?",
+    "¿La indisponibilidad del activo afectaría la operación de TI o Seguridad de la Información?",
+    "¿La indisponibilidad del activo podría generar incumplimiento de obligaciones legales?"
+]
+
+# Opciones para todas las preguntas
+SI_NO = ["Sí", "No"]
 
 USO_SIHOS = ["Local", "Web", "No usa"]
 
@@ -80,24 +202,6 @@ USO_SIFAX = ["Local", "Web", "No usa"]
 USO_OFFICE_BASICO = ["Sí", "No"]
 
 SOFTWARE_ESPECIALIZADO_OPCIONES = ["Sí", "No"]
-
-SI_NO = ["Sí", "No"]
-
-NIVEL_CRITICIDAD = ["CRÍTICO", "ALTO", "MEDIO", "BAJO"]
-
-# Alias para compatibilidad
-CRITICIDAD = NIVEL_CRITICIDAD
-
-CLASIFICACION_CONFIDENCIALIDAD = [
-    "CLASIFICADO",
-    "RESERVADO",
-    "CONFIDENCIAL",
-    "INTERNO",
-    "PÚBLICO",
-]
-
-# Alias para compatibilidad
-CONFIDENCIALIDAD = CLASIFICACION_CONFIDENCIALIDAD
 
 HORARIOS_USO = [
     "24/7",
@@ -371,6 +475,8 @@ TIPOS_MANTENIMIENTO_MTTO = [
 ]
 
 TECNICOS_RESPONSABLES = ["Eduar Cortez", "Heber Valero", "Tecnico Externo", "Otro"]
+
+PERIODICIDADES_MTTO = ["Semestral", "Anual"]
 
 # Alias para compatibilidad
 RESPONSABLE_MTTO = TECNICOS_RESPONSABLES

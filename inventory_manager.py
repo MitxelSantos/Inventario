@@ -19,6 +19,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 import threading
+import tkinter as tk
 
 # Configurar tema CustomTkinter
 ctk.set_appearance_mode("light")
@@ -78,50 +79,114 @@ COLOR_NARANJA = "#F4B183"
 COLOR_FONDO = "#F5F5F5"
 COLOR_ERROR = "#DC3545"
 
+# ============================================================================
+# 1. CLASE TOOLTIP
+# ============================================================================
+
+class ToolTip:
+    """
+    Clase para mostrar tooltips al pasar el mouse sobre un widget.
+    """
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip = None
+        self.widget.bind("<Enter>", self.show_tooltip)
+        self.widget.bind("<Leave>", self.hide_tooltip)
+    
+    def show_tooltip(self, event=None):
+        if self.tooltip:
+            return
+        
+        x, y, _, _ = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 25
+        
+        self.tooltip = tk.Toplevel(self.widget)
+        self.tooltip.wm_overrideredirect(True)
+        self.tooltip.wm_geometry(f"+{x}+{y}")
+        
+        # Frame con borde
+        frame = tk.Frame(self.tooltip, bg="#FFFFCC", relief=tk.SOLID, borderwidth=1)
+        frame.pack()
+        
+        # Label con texto (máximo 600px de ancho)
+        label = tk.Label(
+            frame, 
+            text=self.text, 
+            bg="#FFFFCC",
+            fg="#000000",
+            font=("Segoe UI", 10),
+            wraplength=600,
+            justify=tk.LEFT,
+            padx=10,
+            pady=8
+        )
+        label.pack()
+    
+    def hide_tooltip(self, event=None):
+        if self.tooltip:
+            self.tooltip.destroy()
+            self.tooltip = None
+
 
 # ============================================================================
 # FUNCIONES DE DETECCIÓN
 # ============================================================================
 
 def detect_hardware_wmi():
-    """Detectar hardware usando WMI: Serial + Discos primario y secundario."""
+    """
+    Detectar hardware usando WMI.
+    
+    CORRECCIÓN CRÍTICA: Las claves ahora coinciden EXACTAMENTE con lo que 
+    espera collect_automatic_data():
+    - disco1_capacidad (antes era solo 'capacidad')
+    - disco1_tipo, disco1_serial, disco1_marca, disco1_modelo
+    - disco2_capacidad, disco2_tipo, disco2_serial, disco2_marca, disco2_modelo
+    """
     info = {
         'marca': 'No detectado',
         'modelo': 'No detectado',
         'serial': 'No detectado',
-        'tipo_disco': 'No detectado',
-        # Disco secundario
-        'disco_secundario': 'No tiene',
-        'tipo_disco_secundario': 'No tiene',
-        'serial_disco_secundario': 'No tiene',
-        'marca_disco_secundario': 'No tiene',
-        'modelo_disco_secundario': 'No tiene'
+        # DISCO 1 (Primario) - CLAVES CORREGIDAS ✅
+        'disco1_capacidad': 'No detectado',  # ← Antes: 'capacidad'
+        'disco1_tipo': 'No detectado',       # ← Antes: 'tipo'
+        'disco1_serial': 'No detectado',
+        'disco1_marca': 'No detectado',
+        'disco1_modelo': 'No detectado',
+        # DISCO 2 (Secundario)
+        'disco2_capacidad': 'No tiene',
+        'disco2_tipo': 'No tiene',
+        'disco2_serial': 'No tiene',
+        'disco2_marca': 'No tiene',
+        'disco2_modelo': 'No tiene'
     }
     
     if not HAS_WMI:
         return info
     
     try:
-        # Inicializar COM para evitar errores en threads
+        # Inicializar COM
         try:
             import pythoncom
             pythoncom.CoInitialize()
         except:
-            pass  # Si falla, continuar de todas formas
+            pass
         
         c = wmi.WMI()
         
-        # Información del sistema
+        # ===== INFORMACIÓN DEL SISTEMA =====
         for system in c.Win32_ComputerSystem():
             info['marca'] = system.Manufacturer or 'No detectado'
             info['modelo'] = system.Model or 'No detectado'
         
-        # Serial: Buscar en múltiples lugares
+        # ===== SERIAL DEL EQUIPO =====
         serial_found = False
-        serials_invalidos = ['default string', 'to be filled by o.e.m.', 'system serial number', 
-                            'base board serial number', 'chassis serial number', '']
+        serials_invalidos = ['default string', 'to be filled by o.e.m.', 
+                            'system serial number', 'base board serial number', 
+                            'chassis serial number', '']
         
-        # 1. Intentar desde BIOS
+        # Intentar BIOS primero
         for bios in c.Win32_BIOS():
             serial = (bios.SerialNumber or '').strip()
             if serial and serial.lower() not in serials_invalidos:
@@ -129,16 +194,16 @@ def detect_hardware_wmi():
                 serial_found = True
                 break
         
-        # 2. Si no se encuentra, intentar desde BaseBoard (placa base)
+        # Intentar BaseBoard
         if not serial_found:
             for board in c.Win32_BaseBoard():
                 serial = (board.SerialNumber or '').strip()
                 if serial and serial.lower() not in serials_invalidos:
-                    info['serial'] = f"MB-{serial}"  # Prefijo para identificar origen
+                    info['serial'] = f"MB-{serial}"
                     serial_found = True
                     break
         
-        # 3. Si aún no, intentar desde ComputerSystemProduct
+        # Intentar ComputerSystemProduct
         if not serial_found:
             for product in c.Win32_ComputerSystemProduct():
                 serial = (product.IdentifyingNumber or '').strip()
@@ -147,61 +212,74 @@ def detect_hardware_wmi():
                     serial_found = True
                     break
         
-        # 4. Si aún no hay serial válido, dejar mensaje
         if not serial_found:
             info['serial'] = "No detectado (PC genérico/armado)"
         
-        # DETECCIÓN DE DISCOS (Primario y Secundario)
+        # ===== DISCOS FÍSICOS =====
         disks = list(c.Win32_DiskDrive())
         
+        # DISCO 1 (PRIMARIO) ✅
         if len(disks) > 0:
-            # Disco primario
-            disk = disks[0]
-            media_type = disk.MediaType or ''
+            disk1 = disks[0]
+            
+            # Capacidad en GB
+            try:
+                size_bytes = int(disk1.Size) if disk1.Size else 0
+                size_gb = round(size_bytes / (1024**3))
+                info['disco1_capacidad'] = str(size_gb)  # ← CLAVE CORRECTA
+            except:
+                info['disco1_capacidad'] = 'No detectado'
+            
+            # Tipo (SSD o HDD)
+            media_type = disk1.MediaType or ''
             if 'SSD' in media_type.upper() or 'Solid State' in media_type:
-                info['tipo_disco'] = 'SSD'
+                info['disco1_tipo'] = 'SSD'  # ← CLAVE CORRECTA
             else:
-                info['tipo_disco'] = 'HDD'
+                info['disco1_tipo'] = 'HDD'  # ← CLAVE CORRECTA
+            
+            # Serial
+            serial_disk = (disk1.SerialNumber or '').strip()
+            info['disco1_serial'] = serial_disk if serial_disk else 'No detectado'
+            
+            # Marca
+            marca_disk = (disk1.Manufacturer or '').strip()
+            if marca_disk and marca_disk.lower() not in ['(standard disk drives)', '']:
+                info['disco1_marca'] = marca_disk
+            else:
+                info['disco1_marca'] = 'No detectado'
+            
+            # Modelo
+            modelo_disk = (disk1.Model or '').strip()
+            info['disco1_modelo'] = modelo_disk if modelo_disk else 'No detectado'
         
+        # DISCO 2 (SECUNDARIO) ✅
         if len(disks) > 1:
-            # Disco secundario detectado
             disk2 = disks[1]
             
-            # Capacidad
             try:
                 size_bytes = int(disk2.Size) if disk2.Size else 0
                 size_gb = round(size_bytes / (1024**3))
-                info['disco_secundario'] = str(size_gb)
+                info['disco2_capacidad'] = str(size_gb)
             except:
-                info['disco_secundario'] = 'Detectado'
+                info['disco2_capacidad'] = 'Detectado'
             
-            # Tipo
             media_type = disk2.MediaType or ''
             if 'SSD' in media_type.upper() or 'Solid State' in media_type:
-                info['tipo_disco_secundario'] = 'SSD'
+                info['disco2_tipo'] = 'SSD'
             else:
-                info['tipo_disco_secundario'] = 'HDD'
+                info['disco2_tipo'] = 'HDD'
             
-            # Serial
-            serial_disk = (disk2.SerialNumber or '').strip()
-            if serial_disk:
-                info['serial_disco_secundario'] = serial_disk
-            else:
-                info['serial_disco_secundario'] = 'No detectado'
+            serial_disk2 = (disk2.SerialNumber or '').strip()
+            info['disco2_serial'] = serial_disk2 if serial_disk2 else 'No detectado'
             
-            # Marca
-            marca_disk = (disk2.Manufacturer or '').strip()
-            if marca_disk and marca_disk.lower() not in ['(standard disk drives)', '']:
-                info['marca_disco_secundario'] = marca_disk
+            marca_disk2 = (disk2.Manufacturer or '').strip()
+            if marca_disk2 and marca_disk2.lower() not in ['(standard disk drives)', '']:
+                info['disco2_marca'] = marca_disk2
             else:
-                info['marca_disco_secundario'] = 'No detectado'
+                info['disco2_marca'] = 'No detectado'
             
-            # Modelo
-            modelo_disk = (disk2.Model or '').strip()
-            if modelo_disk:
-                info['modelo_disco_secundario'] = modelo_disk
-            else:
-                info['modelo_disco_secundario'] = 'No detectado'
+            modelo_disk2 = (disk2.Model or '').strip()
+            info['disco2_modelo'] = modelo_disk2 if modelo_disk2 else 'No detectado'
     
     except Exception as e:
         print(f"Error WMI: {e}")
@@ -462,7 +540,6 @@ class InventoryManagerApp:
     
     def create_native_menu(self):
         """Crear menú nativo de tkinter (por encima del header)."""
-        import tkinter as tk
         
         # Crear barra de menú nativa
         menubar = tk.Menu(self.root)
@@ -537,132 +614,284 @@ class InventoryManagerApp:
             self.create_baja_form_directo()
     
     def show_manual_form_in_container(self):
-        """Mostrar formulario de datos manuales en contenedor principal."""
-        # Guardar valores de campos que deben mantenerse antes de limpiar
-        campos_a_mantener = ["tipo_equipo",'area_servicio',"macro_proceso", 'proceso',"sihos","office_basico",
-                             "software_especializado","horario_uso", 'periodicidad_mtto', 'tecnico_responsable']
-        valores_guardados = {}
-        
-        if hasattr(self, 'manual_widgets'):
-            for field_name in campos_a_mantener:
-                if field_name in self.manual_widgets:
-                    try:
-                        widget = self.manual_widgets[field_name]
-                        if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
-                            if isinstance(widget, (ctk.CTkEntry, ctk.CTkComboBox)):
-                                valores_guardados[field_name] = widget.get()
-                    except:
-                        pass
-        
+        """Mostrar formulario manual:"""
         # Limpiar contenedor
         for widget in self.main_container.winfo_children():
             widget.destroy()
         
-        # Frame scrollable para formulario
+        self.manual_widgets = {}
+        
+        # Frame scrollable
         form_frame = ctk.CTkScrollableFrame(
-            self.main_container,
-            fg_color="#FAFAFA",
-            label_text=f"📝 DATOS MANUALES - Equipo #{self.current_row-1} (Código EQC-{self.current_row-1:04d})",
-            label_fg_color=COLOR_VERDE_HOSPITAL,
-            label_text_color="white",
-            label_font=("Segoe UI", 15, "bold")
+            self.main_container, 
+            fg_color="#F5F5F5",
+            corner_radius=0
         )
-        form_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        form_frame.pack(fill="both", expand=True)
         
-        # Guardar referencia para actualizar título después
-        self.equipo_form_frame = form_frame
+        # ===== TÍTULO =====
+        title_frame = ctk.CTkFrame(form_frame, fg_color=COLOR_VERDE_HOSPITAL, corner_radius=12)
+        title_frame.pack(fill="x", padx=20, pady=(20, 10))
         
-        # Campos del formulario
-        fields = [
-            ("* Tipo de Equipo ", "tipo_equipo", "combobox", TIPO_EQUIPO),
-            ("Área *", "area_servicio", "combobox", AREAS_SERVICIOS),
-            ("Ubicación Específica *", "ubicacion_especifica", "entry", None),
-            ("Responsable / Custodio *", "responsable_custodio", "entry", None),
-            ("Macroproceso", "macro_proceso", "combobox", MACRO_PROCESO)
-            ("Proceso *", "proceso", "combobox", PROCESOS),
-            ("Uso - SIHOS *", "uso_sihos", "combobox", USO_SIHOS),
-            ("Uso - SIFAX", "uso_sifax", "combobox", USO_SIFAX),
-            ("Uso - Office Básico", "uso_office_basico", "combobox", USO_OFFICE_BASICO),
-            ("Software Especializado", "software_especializado", "combobox", SOFTWARE_ESPECIALIZADO_OPCIONES),
-            ("Descripción Software Esp.", "descripcion_software", "entry", None),
-            ("Función Principal", "funcion_principal", "entry", None),
-            ("Nivel de Criticidad", "criticidad", "combobox", CRITICIDAD),
-            ("Clasificación Confidencialidad", "confidencialidad", "combobox", CONFIDENCIALIDAD),
-            ("Horario de Uso", "horario_uso", "combobox", HORARIO_USO),
-            ("Estado Operativo *", "estado_operativo", "combobox", ESTADO_OPERATIVO),
-            ("Fecha de Adquisición (YYYY-MM-DD)", "fecha_adquisicion", "entry", None),
-            ("Valor de Adquisición (COP)", "valor_adquisicion", "entry", None),
-            ("Fecha Venc. Garantía (YYYY-MM-DD)", "fecha_venc_garantia", "entry", None),
-            ("Observaciones Técnicas", "observaciones_tecnicas", "entry", None),
-            ("Fecha Exp. Antivirus (YYYY-MM-DD)", "fecha_exp_antivirus", "entry", None),
-            ("Periodicidad Mtto", "periodicidad_mtto", "combobox", PERIODICIDAD_MTTO),
-            ("Responsable Mtto", "responsable_mtto", "combobox", RESPONSABLE_MTTO),
-            ("Último Mantenimiento (YYYY-MM-DD)", "ultimo_mantenimiento", "entry", None),
-            ("Tipo Último Mtto", "tipo_ultimo_mtto", "combobox", TIPO_MTTO),
-        ]
+        # Obtener código siguiente
+        try:
+            next_code = self.get_next_codigo()
+            codigo_text = f"Código: {next_code}"
+        except:
+            codigo_text = "Código: EQC-0001"
         
-        for label_text, field_name, field_type, options in fields:
-            self.create_form_field(form_frame, label_text, field_name, field_type, options)
+        title_label = ctk.CTkLabel(
+            title_frame,
+            text=f"📝 DATOS MANUALES - Equipo #1 ({codigo_text})",
+            font=("Segoe UI", 16, "bold"),
+            text_color=COLOR_VERDE_HOSPITAL
+        )
+        title_label.pack(pady=15)
         
-        # Restaurar valores guardados
-        for field_name, valor in valores_guardados.items():
-            if field_name in self.manual_widgets and valor:
-                try:
-                    widget = self.manual_widgets[field_name]
-                    if isinstance(widget, ctk.CTkEntry):
-                        widget.insert(0, valor)
-                    elif isinstance(widget, ctk.CTkComboBox):
-                        widget.set(valor)
-                except:
-                    pass
+        # ===== CAMPOS BÁSICOS =====
+        self.create_form_field_centered(form_frame, "* Tipo de Equipo", "tipo_equipo", 
+                                        "combobox", TIPOS_EQUIPO)
+        self.create_form_field_centered(form_frame, "* Área / Servicio", "area_servicio", 
+                                        "combobox", AREAS_SERVICIO)
+        self.create_form_field_centered(form_frame, "* Ubicación Específica", "ubicacion_especifica", 
+                                        "entry")
+        self.create_form_field_centered(form_frame, "* Responsable / Custodio", "responsable_custodio", 
+                                        "entry")
         
-        # Frame para botones de acción
+        # ===== SECCIÓN: CLASIFICACIÓN POR PROCESOS =====
+        separator1 = ctk.CTkFrame(form_frame, height=2, fg_color="#CCCCCC")
+        separator1.pack(fill="x", padx=20, pady=15)
+        
+        label_procesos = ctk.CTkLabel(
+            form_frame,
+            text="🏥 CLASIFICACIÓN POR PROCESOS",
+            font=("Segoe UI", 14, "bold"),
+            text_color=COLOR_AZUL_HOSPITAL
+        )
+        label_procesos.pack(pady=(10, 15))
+        
+        self.create_form_field_centered(form_frame, "* Macroproceso", "macroproceso", 
+                                        "combobox", list(MACROPROCESOS.keys()))
+        self.create_form_field_centered(form_frame, "* Proceso", "proceso", 
+                                        "combobox", ["Selecciona primero Macroproceso"])
+        self.create_form_field_centered(form_frame, "* Subproceso", "subproceso", 
+                                        "combobox", ["Selecciona primero Proceso"])
+        
+        # Configurar eventos condicionales
+        self.manual_widgets['macroproceso'].configure(
+            command=lambda choice: self.on_macroproceso_change(choice)
+        )
+        self.manual_widgets['proceso'].configure(
+            command=lambda choice: self.on_proceso_change(choice)
+        )
+        
+        # ===== SECCIÓN: SOFTWARE =====
+        separator2 = ctk.CTkFrame(form_frame, height=2, fg_color="#CCCCCC")
+        separator2.pack(fill="x", padx=20, pady=15)
+        
+        label_software = ctk.CTkLabel(
+            form_frame,
+            text="💻 SOFTWARE UTILIZADO",
+            font=("Segoe UI", 14, "bold"),
+            text_color=COLOR_AZUL_HOSPITAL
+        )
+        label_software.pack(pady=(10, 15))
+        
+        self.create_form_field_centered(form_frame, "* Uso - SIHOS", "uso_sihos", 
+                                        "combobox", SI_NO)
+        self.create_form_field_centered(form_frame, "Uso - SIFAX", "uso_sifax", 
+                                        "combobox", SI_NO)
+        self.create_form_field_centered(form_frame, "Uso - Office Básico", "uso_office_basico", 
+                                        "combobox", SI_NO)
+        self.create_form_field_centered(form_frame, "Software Especializado", "software_especializado", 
+                                        "combobox", SI_NO)
+        self.create_form_field_centered(form_frame, "Descripción Software", "descripcion_software", 
+                                        "entry")
+        self.create_form_field_centered(form_frame, "Función Principal", "funcion_principal", 
+                                        "entry")
+        
+        # ===== SECCIÓN: CUESTIONARIO CON RADIOBUTTONS =====
+        from textos_tooltips import (
+            CONF_LABELS, CONF_TOOLTIPS,
+            INT_LABELS, INT_TOOLTIPS,
+            CRIT_LABELS, CRIT_TOOLTIPS
+        )
+        
+        separator3 = ctk.CTkFrame(form_frame, height=2, fg_color="#CCCCCC")
+        separator3.pack(fill="x", padx=20, pady=15)
+        
+        label_cuestionario = ctk.CTkLabel(
+            form_frame,
+            text="🔒 CUESTIONARIO DE CLASIFICACIÓN (18 Preguntas Sí/No)",
+            font=("Segoe UI", 14, "bold"),
+            text_color=COLOR_AZUL_HOSPITAL
+        )
+        label_cuestionario.pack(pady=(10, 5))
+        
+        info_cuestionario = ctk.CTkLabel(
+            form_frame,
+            text="Selecciona Sí o No • Pasa el mouse sobre el texto para ver la pregunta completa",
+            font=("Segoe UI", 11, "italic"),
+            text_color="gray"
+        )
+        info_cuestionario.pack(pady=(0, 15))
+        
+        # CONFIDENCIALIDAD (9 preguntas - RadioButtons)
+        label_conf = ctk.CTkLabel(
+            form_frame,
+            text="📋 CONFIDENCIALIDAD (Tipo de información):",
+            font=("Segoe UI", 12, "bold"),
+            text_color="#6F42C1"
+        )
+        label_conf.pack(anchor="w", padx=40, pady=(10, 5))
+        
+        for i, (label_text, tooltip_text) in enumerate(zip(CONF_LABELS, CONF_TOOLTIPS), 1):
+            field_name = f"conf_{i}"
+            self.create_radio_field_centered(form_frame, label_text, field_name, tooltip_text)
+        
+        # INTEGRIDAD (3 preguntas - RadioButtons)
+        label_int = ctk.CTkLabel(
+            form_frame,
+            text="🔐 INTEGRIDAD (Compromiso de información):",
+            font=("Segoe UI", 12, "bold"),
+            text_color="#FD7E14"
+        )
+        label_int.pack(anchor="w", padx=40, pady=(15, 5))
+        
+        for i, (label_text, tooltip_text) in enumerate(zip(INT_LABELS, INT_TOOLTIPS), 1):
+            field_name = f"int_{i}"
+            self.create_radio_field_centered(form_frame, label_text, field_name, tooltip_text)
+        
+        # CRITICIDAD (6 preguntas - RadioButtons)
+        label_crit = ctk.CTkLabel(
+            form_frame,
+            text="⚠️ CRITICIDAD (Impacto operacional):",
+            font=("Segoe UI", 12, "bold"),
+            text_color="#DC3545"
+        )
+        label_crit.pack(anchor="w", padx=40, pady=(15, 5))
+        
+        for i, (label_text, tooltip_text) in enumerate(zip(CRIT_LABELS, CRIT_TOOLTIPS), 1):
+            field_name = f"crit_{i}"
+            self.create_radio_field_centered(form_frame, label_text, field_name, tooltip_text)
+        
+        # ===== SECCIÓN: INFORMACIÓN OPERATIVA =====
+        separator4 = ctk.CTkFrame(form_frame, height=2, fg_color="#CCCCCC")
+        separator4.pack(fill="x", padx=20, pady=15)
+        
+        label_operativo = ctk.CTkLabel(
+            form_frame,
+            text="⚙️ INFORMACIÓN OPERATIVA",
+            font=("Segoe UI", 14, "bold"),
+            text_color=COLOR_AZUL_HOSPITAL
+        )
+        label_operativo.pack(pady=(10, 15))
+        
+        self.create_form_field_centered(form_frame, "Horario de Uso", "horario_uso", 
+                                        "combobox", HORARIOS_USO)
+        self.create_form_field_centered(form_frame, "* Estado Operativo", "estado_operativo", 
+                                        "combobox", ESTADOS_OPERATIVOS)
+        self.create_form_field_centered(form_frame, "Fecha Adquisición (YYYY-MM-DD)", 
+                                        "fecha_adquisicion", "entry")
+        self.create_form_field_centered(form_frame, "Valor Adquisición", "valor_adquisicion", 
+                                        "entry")
+        self.create_form_field_centered(form_frame, "Fecha Venc. Garantía (YYYY-MM-DD)", 
+                                        "fecha_venc_garantia", "entry")
+        self.create_form_field_centered(form_frame, "Observaciones Técnicas", "observaciones_tecnicas", 
+                                        "entry")
+        self.create_form_field_centered(form_frame, "Fecha Exp. Antivirus (YYYY-MM-DD)", 
+                                        "fecha_exp_antivirus", "entry")
+        self.create_form_field_centered(form_frame, "Periodicidad Mantenimiento", "periodicidad_mtto", 
+                                        "combobox", PERIODICIDADES_MTTO)
+        self.create_form_field_centered(form_frame, "Responsable Mantenimiento", "responsable_mtto", 
+                                        "entry")
+        self.create_form_field_centered(form_frame, "Último Mantenimiento (YYYY-MM-DD)", 
+                                        "ultimo_mantenimiento", "entry")
+        self.create_form_field_centered(form_frame, "Tipo Último Mantenimiento", "tipo_ultimo_mtto", 
+                                        "combobox", TIPOS_MANTENIMIENTO_MTTO)
+        self.create_form_field_centered(form_frame, "Reservada", "reservada", "entry")
+        
+        # ===== BOTONES (3 HORIZONTALES IGUALES) =====
+        separator5 = ctk.CTkFrame(form_frame, height=2, fg_color="#CCCCCC")
+        separator5.pack(fill="x", padx=20, pady=15)
+        
         btn_action_frame = ctk.CTkFrame(form_frame, fg_color="transparent")
-        btn_action_frame.pack(pady=20, padx=20, fill="x")
+        btn_action_frame.pack(pady=20)
         
-        # Botón GUARDAR NUEVO (solo datos manuales)
+        BTN_WIDTH = 350
+        BTN_HEIGHT = 50
+        
+        # Botón 1: GUARDAR
         self.btn_save_equipo = ctk.CTkButton(
             btn_action_frame,
-            text="💾 GUARDAR NUEVO (Solo Datos Manuales)",
+            text="💾 GUARDAR",
             command=self.save_equipo_manual_only,
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 13, "bold"),
             fg_color=COLOR_VERDE_HOSPITAL,
             hover_color="#1F5039",
-            height=50,
-            width=350
+            height=BTN_HEIGHT,
+            width=BTN_WIDTH
         )
-        self.btn_save_equipo.pack(side="left", padx=10)
+        self.btn_save_equipo.pack(side="left", padx=8)
         
-        # Botón ACTUALIZAR EXISTENTE
+        # Botón 2: ACTUALIZAR
         btn_update = ctk.CTkButton(
             btn_action_frame,
-            text="🔄 ACTUALIZAR EXISTENTE",
+            text="🔄 ACTUALIZAR",
             command=self.update_equipo_computo,
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 13, "bold"),
             fg_color="#2196F3",
             hover_color="#1976D2",
-            height=50,
-            width=350
+            height=BTN_HEIGHT,
+            width=BTN_WIDTH
         )
-        btn_update.pack(side="left", padx=10)
+        btn_update.pack(side="left", padx=8)
         
-        # Separador
-        separator = ctk.CTkFrame(form_frame, height=2, fg_color="#E0E0E0")
-        separator.pack(fill="x", padx=20, pady=15)
-        
-        # Botón de recopilación automática
+        # Botón 3: RECOPILACIÓN AUTOMÁTICA
         btn_collect = ctk.CTkButton(
-            form_frame,
-            text="➡️ CONTINUAR: RECOPILACIÓN AUTOMÁTICA COMPLETA",
+            btn_action_frame,
+            text="➡️ RECOPILACIÓN AUTO",
             command=self.start_automatic_collection,
-            font=("Arial", 16, "bold"),
+            font=("Segoe UI", 13, "bold"),
             fg_color="#FF9800",
             hover_color="#F57C00",
-            height=50
+            height=BTN_HEIGHT,
+            width=BTN_WIDTH
         )
-        btn_collect.pack(pady=20, padx=20, fill="x")
+        btn_collect.pack(side="left", padx=8)
+
+    def on_macroproceso_change(self, selected_macroproceso):
+        """Actualizar lista de Procesos cuando cambia el Macroproceso."""
+        # Limpiar proceso y subproceso
+        self.manual_widgets["proceso"].set("")
+        self.manual_widgets["subproceso"].set("")
+        self.manual_widgets["subproceso"].configure(values=[])
+        
+        # Obtener procesos del macroproceso seleccionado
+        from config_listas import get_procesos_por_macroproceso
+        procesos = get_procesos_por_macroproceso(selected_macroproceso)
+        
+        # Actualizar lista de procesos
+        self.manual_widgets["proceso"].configure(values=procesos)
 
 
+    def on_proceso_change(self, selected_proceso):
+        """Actualizar lista de Subprocesos cuando cambia el Proceso."""
+        # Limpiar subproceso
+        self.manual_widgets["subproceso"].set("")
+        
+        # Obtener macroproceso actual
+        macroproceso = self.manual_widgets["macroproceso"].get()
+        
+        if not macroproceso:
+            return
+        
+        # Obtener subprocesos
+        from config_listas import get_subprocesos_por_proceso
+        subprocesos = get_subprocesos_por_proceso(macroproceso, selected_proceso)
+        
+        # Actualizar lista de subprocesos
+        self.manual_widgets["subproceso"].configure(values=subprocesos)
 
     def create_impresoras_form_directo(self):
         """Crear formulario de impresoras directamente."""
@@ -726,15 +955,15 @@ class InventoryManagerApp:
             return 2
     
     def create_header(self):
-        """Crear encabezado con diseño profesional - VERDE."""
+        """Crear encabezado."""
         header_frame = ctk.CTkFrame(self.root, fg_color=COLOR_VERDE_HOSPITAL, corner_radius=0)
         header_frame.pack(fill="x", padx=0, pady=0)
         
-        # Frame interno para organizar logo + texto
+        # Frame interno
         content_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         content_frame.pack(pady=18)
         
-        # Intentar cargar logo institucional
+        # Cargar logo
         if HAS_PIL:
             logo_paths = [
                 "logo_hospital.png",
@@ -746,15 +975,68 @@ class InventoryManagerApp:
             for logo_path in logo_paths:
                 if os.path.exists(logo_path):
                     try:
-                        logo_image = Image.open(logo_path)
-                        # Redimensionar a altura 70px manteniendo proporción
-                        aspect_ratio = logo_image.width / logo_image.height
-                        new_height = 70
-                        new_width = int(new_height * aspect_ratio)
-                        logo_image = logo_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                        from PIL import Image, ImageDraw
                         
-                        logo_ctk = ctk.CTkImage(light_image=logo_image, dark_image=logo_image, 
-                                               size=(new_width, new_height))
+                        # 1. Cargar logo
+                        logo_original = Image.open(logo_path)
+                        
+                        # 2. Convertir a RGBA (con transparencia)
+                        if logo_original.mode != 'RGBA':
+                            logo_original = logo_original.convert('RGBA')
+                        
+                        # 3. ELIMINAR FONDO DEL LOGO (hacer transparente)
+                        # Detectar color predominante (probablemente verde o blanco)
+                        logo_data = logo_original.getdata()
+                        new_data = []
+                        
+                        for item in logo_data:
+                            # Si el píxel es muy verde o muy blanco, hacerlo transparente
+                            # Verde hospital: aproximadamente RGB(46, 125, 50)
+                            r, g, b = item[:3]
+                            
+                            # Condición: píxel verde o blanco → transparente
+                            es_verde = (g > r + 20 and g > b + 20 and g > 100)  # Verde predominante
+                            es_blanco = (r > 240 and g > 240 and b > 240)  # Casi blanco
+                            
+                            if es_verde or es_blanco:
+                                # Hacer transparente
+                                new_data.append((r, g, b, 0))
+                            else:
+                                # Mantener píxel original
+                                new_data.append(item)
+                        
+                        logo_sin_fondo = Image.new('RGBA', logo_original.size)
+                        logo_sin_fondo.putdata(new_data)
+                        
+                        # 4. Redimensionar logo limpio
+                        aspect_ratio = logo_sin_fondo.width / logo_sin_fondo.height
+                        new_height = 60  # Más pequeño para que quepa bien
+                        new_width = int(new_height * aspect_ratio)
+                        logo_limpio = logo_sin_fondo.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                        
+                        # 5. Crear círculo blanco de fondo
+                        circle_size = 85
+                        background = Image.new('RGBA', (circle_size, circle_size), (0, 0, 0, 0))
+                        
+                        # Dibujar círculo blanco sólido
+                        draw = ImageDraw.Draw(background)
+                        draw.ellipse([0, 0, circle_size-1, circle_size-1], 
+                                    fill=(255, 255, 255, 255), 
+                                    outline=None)
+                        
+                        # 6. Centrar logo LIMPIO sobre círculo blanco
+                        x_offset = (circle_size - new_width) // 2
+                        y_offset = (circle_size - new_height) // 2
+                        
+                        # Pegar logo (con transparencia)
+                        background.paste(logo_limpio, (x_offset, y_offset), logo_limpio)
+                        
+                        # 7. Convertir a CTkImage
+                        logo_ctk = ctk.CTkImage(
+                            light_image=background, 
+                            dark_image=background, 
+                            size=(circle_size, circle_size)
+                        )
                         
                         logo_label = ctk.CTkLabel(
                             content_frame,
@@ -762,16 +1044,15 @@ class InventoryManagerApp:
                             text=""
                         )
                         logo_label.pack(side="left", padx=(0, 25))
-                        print(f"✓ Logo cargado: {logo_path}")
+                        print(f"✓ Logo limpio y transparente: {logo_path}")
                         break
+                        
                     except Exception as e:
                         print(f"✗ Error al cargar logo {logo_path}: {e}")
-            else:
-                print("ℹ No se encontró logo (logo_hospital.png, logo.png, etc.)")
-        else:
-            print("ℹ PIL/Pillow no instalado - Logo no disponible")
+                        import traceback
+                        traceback.print_exc()
         
-        # Frame para texto (derecha del logo o solo si no hay logo)
+        # Texto del header
         text_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
         text_frame.pack(side="left")
         
@@ -791,7 +1072,6 @@ class InventoryManagerApp:
         )
         subtitle_label.pack(pady=(2, 0))
         
-        # Label de estado del archivo cargado (esquina superior derecha)
         self.status_label = ctk.CTkLabel(
             header_frame,
             text="",
@@ -946,33 +1226,39 @@ class InventoryManagerApp:
         next_row = self.get_next_available_row("Equipos Dados de Baja", check_column=1, max_rows=200)
         return next_row - 1
     
-    def create_form_field(self, parent, label_text, field_name, field_type, options):
-        """Crear campo del formulario con diseño mejorado."""
-        # Frame con fondo blanco y bordes sutiles
+    def create_form_field(self, parent, label_text, field_name, field_type, options, tooltip_text=None):
+        """Crear campo CENTRADO con mejor distribución de espacio."""
+        # Frame principal - CENTRADO
         field_frame = ctk.CTkFrame(parent, fg_color="white", corner_radius=8)
-        field_frame.pack(fill="x", padx=15, pady=6)
+        field_frame.pack(fill="x", padx=40, pady=6)  # Más padding lateral = más centrado
         
-        # Frame interno para contenido
+        # Frame interno - Grid layout para mejor control
         inner_frame = ctk.CTkFrame(field_frame, fg_color="transparent")
-        inner_frame.pack(fill="x", padx=15, pady=10)
+        inner_frame.pack(fill="x", padx=20, pady=10)
         
-        # Label mejorado
+        # Configurar grid (2 columnas)
+        inner_frame.grid_columnconfigure(0, weight=6)  # Label: 60%
+        inner_frame.grid_columnconfigure(1, weight=4)  # Widget: 40%
+        
+        # Label (columna 0)
         label = ctk.CTkLabel(
             inner_frame,
             text=label_text,
             font=("Segoe UI", 12, "bold"),
-            width=320,
             anchor="w",
             text_color="#333333"
         )
-        label.pack(side="left", padx=(0, 20))
+        label.grid(row=0, column=0, sticky="w", padx=(0, 15))
         
-        # Widget según tipo
+        # Tooltip
+        if tooltip_text:
+            ToolTip(label, tooltip_text)
+        
+        # Widget (columna 1)
         if field_type == "combobox":
             widget = ctk.CTkComboBox(
                 inner_frame,
-                values=options,
-                width=620,
+                values=options if options else [],
                 height=35,
                 font=("Segoe UI", 11),
                 dropdown_font=("Segoe UI", 10),
@@ -981,40 +1267,111 @@ class InventoryManagerApp:
                 button_hover_color="#1F5A32",
                 corner_radius=8
             )
-        else:  # entry
+            widget.grid(row=0, column=1, sticky="ew")  # "ew" = expand horizontalmente
+            
+        elif field_type == "entry":
             widget = ctk.CTkEntry(
                 inner_frame,
-                width=620,
                 height=35,
                 font=("Segoe UI", 11),
                 border_color="#CCCCCC",
                 fg_color="white",
                 corner_radius=8
             )
+            widget.grid(row=0, column=1, sticky="ew")
         
-        widget.pack(side="left", fill="x", expand=True)
         self.manual_widgets[field_name] = widget
-        return widget  # ← RETORNAR el widget creado
+        return widget
+    
+    def create_radio_field_centered(self, parent, label_text, field_name, tooltip_text=None):
+        """
+        Crear campo con RadioButtons CENTRADO (para preguntas Sí/No).
+        """
+        # Frame principal - CENTRADO
+        field_frame = ctk.CTkFrame(parent, fg_color="white", corner_radius=8)
+        field_frame.pack(fill="x", padx=40, pady=6)
+        
+        # Frame interno - Grid layout
+        inner_frame = ctk.CTkFrame(field_frame, fg_color="transparent")
+        inner_frame.pack(fill="x", padx=20, pady=10)
+        
+        # Configurar grid
+        inner_frame.grid_columnconfigure(0, weight=6)  # Label: 60%
+        inner_frame.grid_columnconfigure(1, weight=4)  # RadioButtons: 40%
+        
+        # Label (columna 0)
+        label = ctk.CTkLabel(
+            inner_frame,
+            text=label_text,
+            font=("Segoe UI", 12, "bold"),
+            anchor="w",
+            text_color="#333333"
+        )
+        label.grid(row=0, column=0, sticky="w", padx=(0, 15))
+        
+        # Tooltip
+        if tooltip_text:
+            ToolTip(label, tooltip_text)
+        
+        # Frame para RadioButtons (columna 1)
+        radio_frame = ctk.CTkFrame(inner_frame, fg_color="transparent")
+        radio_frame.grid(row=0, column=1, sticky="w")
+        
+        # Variable para almacenar selección
+        var = tk.StringVar(value="")
+        
+        # RadioButton SÍ
+        radio_si = ctk.CTkRadioButton(
+            radio_frame,
+            text="Sí",
+            variable=var,
+            value="Sí",
+            font=("Segoe UI", 12),
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5A32",
+            border_width_checked=8,
+            border_width_unchecked=2
+        )
+        radio_si.pack(side="left", padx=(0, 20))
+        
+        # RadioButton NO
+        radio_no = ctk.CTkRadioButton(
+            radio_frame,
+            text="No",
+            variable=var,
+            value="No",
+            font=("Segoe UI", 12),
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5A32",
+            border_width_checked=8,
+            border_width_unchecked=2
+        )
+        radio_no.pack(side="left")
+        
+        # Guardar variable
+        self.manual_widgets[field_name] = var
+        
+        return var
     
     def show_classification_guide(self):
-        """Mostrar ventana con guía de clasificación normativa - CLARA Y ÚTIL."""
+        """Mostrar guía de formulario."""
         guide_window = ctk.CTkToplevel(self.root)
-        guide_window.title("Guía de Clasificación Normativa")
-        guide_window.geometry("1200x750")
+        guide_window.title("Guía del Formulario")
+        guide_window.geometry("1000x700")
         
         # Centrar
         guide_window.update_idletasks()
-        x = (guide_window.winfo_screenwidth() // 2) - 600
-        y = (guide_window.winfo_screenheight() // 2) - 375
-        guide_window.geometry(f"1200x750+{x}+{y}")
+        x = (guide_window.winfo_screenwidth() // 2) - 500
+        y = (guide_window.winfo_screenheight() // 2) - 350
+        guide_window.geometry(f"1000x700+{x}+{y}")
         
-        # Header verde profesional
+        # Header
         header_frame = ctk.CTkFrame(guide_window, fg_color=COLOR_VERDE_HOSPITAL, corner_radius=0)
         header_frame.pack(fill="x", padx=0, pady=0)
         
         header = ctk.CTkLabel(
             header_frame,
-            text="📋 GUÍA DE CLASIFICACIÓN NORMATIVA",
+            text="📋 GUÍA DEL FORMULARIO",
             font=("Segoe UI", 24, "bold"),
             text_color="white"
         )
@@ -1022,681 +1379,261 @@ class InventoryManagerApp:
         
         subtitle = ctk.CTkLabel(
             header_frame,
-            text="Criterios según MinTIC PETI y MinSalud - Resolución 2183 de 2004",
+            text="Sistema de Inventario Tecnológico v2.0",
             font=("Segoe UI", 12),
             text_color="white"
         )
         subtitle.pack(pady=(0, 18))
         
-        # Crear Tabview
-        tabview = ctk.CTkTabview(guide_window, width=1150, height=580)
+        # Tabview
+        tabview = ctk.CTkTabview(guide_window, width=950, height=530)
         tabview.pack(pady=15, padx=25)
         
-        # Crear tabs
-        tabview.add("🔴 Criticidad")
-        tabview.add("🔒 Confidencialidad")
-        tabview.add("🏥 Procesos")
-        tabview.add("💻 Sistemas")
-        tabview.add("⚡ Otros")
+        # Tabs
+        tabview.add("🔄 Flujo del Proceso")
+        tabview.add("🏥 Macroproceso/Proceso")
+        tabview.add("💡 Tips para Campos")
         
-        # ===== TAB 1: CRITICIDAD =====
-        self._create_criticality_tab_clean(tabview.tab("🔴 Criticidad"))
+        # ===== TAB 1: FLUJO DEL PROCESO =====
+        self._create_flujo_tab(tabview.tab("🔄 Flujo del Proceso"))
         
-        # ===== TAB 2: CONFIDENCIALIDAD =====
-        self._create_confidentiality_tab_clean(tabview.tab("🔒 Confidencialidad"))
+        # ===== TAB 2: MACROPROCESO/PROCESO =====
+        self._create_macroproceso_tab(tabview.tab("🏥 Macroproceso/Proceso"))
         
-        # ===== TAB 3: PROCESOS =====
-        self._create_processes_tab_clean(tabview.tab("🏥 Procesos"))
+        # ===== TAB 3: TIPS =====
+        self._create_tips_tab(tabview.tab("💡 Tips para Campos"))
         
-        # ===== TAB 4: SISTEMAS =====
-        self._create_systems_tab_clean(tabview.tab("💻 Sistemas"))
-        
-        # ===== TAB 5: OTROS =====
-        self._create_others_tab_clean(tabview.tab("⚡ Otros"))
-        
-        # Botón cerrar mejorado
-        btn_frame = ctk.CTkFrame(guide_window, fg_color="transparent")
-        btn_frame.pack(pady=15)
-        
+        # Botón cerrar
         btn_close = ctk.CTkButton(
-            btn_frame,
+            guide_window,
             text="✓ ENTENDIDO",
             command=guide_window.destroy,
             font=("Segoe UI", 14, "bold"),
             fg_color=COLOR_VERDE_HOSPITAL,
             hover_color="#1F5A32",
             height=45,
-            width=250,
-            corner_radius=10
+            width=200
         )
-        btn_close.pack()
-    
-    def _create_criticality_tab_clean(self, parent):
-        """Tab de criticidad con mensajes CLAROS y ÚTILES."""
+        btn_close.pack(pady=15)
+
+    def _create_flujo_tab(self, parent):
+        """Tab de flujo del proceso."""
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
         
-        # Título
-        title = ctk.CTkLabel(
-            scroll,
-            text="NIVEL DE CRITICIDAD - ¿Qué tan importante es este equipo?",
-            font=("Segoe UI", 17, "bold"),
-            text_color=COLOR_VERDE_HOSPITAL
-        )
-        title.pack(pady=(0, 15))
-        
-        intro = ctk.CTkLabel(
-            scroll,
-            text="Pregúntate: ¿Qué pasa si este equipo falla ahora mismo?",
-            font=("Segoe UI", 12, "italic"),
-            text_color="#666666"
-        )
-        intro.pack(pady=(0, 20))
-        
-        levels = [
-            ("🔴 CRÍTICO", "#DC3545", 
-             "Si falla, se PARALIZA atención de pacientes",
-             [
-                "✓ Usa en: Equipos de Urgencias, UCI, Quirófanos",
-                "✓ Usa en: Equipos que corren SIHOS/SIFAX 24/7",
-                "✓ Usa en: Servidor principal, estaciones de enfermería críticas",
-                "✗ NO uses en: Equipos administrativos o de oficina",
-                "⏱ Falla: Menos de 1 hora de tolerancia",
-                "💡 Ejemplo: PC Estación Enfermería UCI, Servidor SIHOS Principal"
-            ]),
-            ("🟠 ALTO", "#FD7E14",
-             "Si falla, afecta operación importante del hospital",
-             [
-                "✓ Usa en: Laboratorio, Imágenes, Farmacia, Facturación",
-                "✓ Usa en: Equipos que procesan pacientes directamente",
-                "✓ Usa en: Consulta Externa, Hospitalización",
-                "✗ NO uses en: Equipos que solo hacen Office/email",
-                "⏱ Falla: Menos de 4 horas de tolerancia",
-                "💡 Ejemplo: PC Laboratorio Clínico, PC Facturación Principal"
-            ]),
-            ("🟡 MEDIO", "#FFC107",
-             "Si falla, afecta trabajo pero NO se paraliza nada",
-             [
-                "✓ Usa en: Contabilidad, Recursos Humanos, Calidad",
-                "✓ Usa en: Oficinas administrativas en general",
-                "✓ Usa en: Equipos de apoyo que usan Office/email",
-                "✗ NO uses en: Áreas que atienden pacientes",
-                "⏱ Falla: Puede esperar 1 día",
-                "💡 Ejemplo: PC Contador, PC Recursos Humanos, PC Secretaria"
-            ]),
-            ("🟢 BAJO", "#28A745",
-             "Si falla, casi no afecta - uso esporádico",
-             [
-                "✓ Usa en: Almacén, Servicios Generales, Mantenimiento",
-                "✓ Usa en: Equipos usados ocasionalmente",
-                "✓ Usa en: Equipos de respaldo o bodega",
-                "✗ NO uses en: Áreas operativas diarias",
-                "⏱ Falla: Puede esperar varios días",
-                "💡 Ejemplo: PC Almacén, PC Mantenimiento Ocasional"
-            ])
-        ]
-        
-        for level_name, color, pregunta, items in levels:
-            frame = ctk.CTkFrame(scroll, fg_color="#F5F5F5", corner_radius=10)
-            frame.pack(fill="x", pady=10, padx=5)
-            
-            # Título con color
-            label_title = ctk.CTkLabel(
-                frame,
-                text=level_name,
-                font=("Segoe UI", 16, "bold"),
-                text_color=color
-            )
-            label_title.pack(anchor="w", padx=20, pady=(15, 5))
-            
-            # Pregunta clave
-            label_pregunta = ctk.CTkLabel(
-                frame,
-                text=f"➤ {pregunta}",
-                font=("Segoe UI", 12, "bold"),
-                text_color="#333333",
-                anchor="w"
-            )
-            label_pregunta.pack(anchor="w", padx=20, pady=(5, 10), fill="x")
-            
-            # Items
-            for item in items:
-                label = ctk.CTkLabel(
-                    frame,
-                    text=f"  {item}",
-                    font=("Segoe UI", 11),
-                    text_color="#333333",
-                    anchor="w",
-                    justify="left"
-                )
-                label.pack(anchor="w", padx=25, pady=2, fill="x")
-            
-            ctk.CTkLabel(frame, text="", height=8).pack()
+        content = """
+    🔄 FLUJO DEL PROCESO DE INVENTARIO
+
+    1️⃣ DATOS MANUALES
+    • Información básica del equipo
+    • Área, ubicación, responsable
+    • Software utilizado (SIHOS, SIFAX, Office)
+    • Información operativa (horarios, estado, garantía)
+    • Macroproceso → Proceso → Subproceso (condicional)
+    • Cuestionario de clasificación (18 preguntas)
     
-    def _create_confidentiality_tab_clean(self, parent):
-        """Tab de confidencialidad con mensajes CLAROS y ÚTILES."""
-        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        title = ctk.CTkLabel(
-            scroll,
-            text="CONFIDENCIALIDAD - ¿Qué tipo de información maneja?",
-            font=("Segoe UI", 17, "bold"),
-            text_color=COLOR_VERDE_HOSPITAL
-        )
-        title.pack(pady=(0, 15))
-        
-        intro = ctk.CTkLabel(
-            scroll,
-            text="Pregúntate: ¿Qué tan sensible es la información en este equipo?",
-            font=("Segoe UI", 12, "italic"),
-            text_color="#666666"
-        )
-        intro.pack(pady=(0, 20))
-        
-        levels = [
-            ("🔒 CLASIFICADA", "#6F42C1",
-             "Información médica ultra-sensible - Máxima protección",
-             [
-                "✓ Usa en: Equipos que manejan historias clínicas completas",
-                "✓ Usa en: Resultados VIH, salud mental, genética",
-                "✓ Usa en: Datos financieros de pacientes",
-                "⚠ Requiere: Cifrado OBLIGATORIO del disco",
-                "⚠ Requiere: Auditoría permanente de accesos",
-                "💡 Ejemplo: PC Psicología (salud mental), Servidor Historias Clínicas"
-            ]),
-            ("🔐 RESERVADA", "#DC3545",
-             "Información protegida por ley - Alta protección",
-             [
-                "✓ Usa en: Equipos con identificación de pacientes",
-                "✓ Usa en: Resultados de laboratorio, radiología",
-                "✓ Usa en: Nómina, contabilidad sensible",
-                "⚠ Requiere: Cifrado recomendado",
-                "⚠ Requiere: Auditoría regular",
-                "💡 Ejemplo: PC Laboratorio, PC Facturación, PC Nómina"
-            ]),
-            ("🔓 CONFIDENCIAL", "#FD7E14",
-             "Información interna del hospital - Protección estándar",
-             [
-                "✓ Usa en: Procedimientos internos, manuales",
-                "✓ Usa en: Estadísticas sin nombres de pacientes",
-                "✓ Usa en: Informes de gestión",
-                "⚠ Requiere: Protección estándar (usuario/contraseña)",
-                "💡 Ejemplo: PC Calidad (informes), PC Planeación (estadísticas)"
-            ]),
-            ("🔓 INTERNA", "#20C997",
-             "Información de trabajo diario - Protección básica",
-             [
-                "✓ Usa en: Todo el personal puede ver esta información",
-                "✓ Usa en: Políticas, directorio, calendario",
-                "✓ Usa en: Circulares, comunicados internos",
-                "⚠ Requiere: Solo login básico",
-                "💡 Ejemplo: PC Secretaria (circulares), PC Recepción (directorio)"
-            ]),
-            ("🌐 PÚBLICA", "#17A2B8",
-             "Información sin restricciones - Sin protección especial",
-             [
-                "✓ Usa en: Información que puede ver cualquier persona",
-                "✓ Usa en: Horarios, servicios, página web",
-                "✓ Usa en: Información de contacto general",
-                "⚠ No requiere protección especial",
-                "💡 Ejemplo: PC Mercadeo (web pública), Kiosco Información"
-            ])
-        ]
-        
-        for level_name, color, pregunta, items in levels:
-            frame = ctk.CTkFrame(scroll, fg_color="#F5F5F5", corner_radius=10)
-            frame.pack(fill="x", pady=10, padx=5)
-            
-            label_title = ctk.CTkLabel(
-                frame,
-                text=level_name,
-                font=("Segoe UI", 16, "bold"),
-                text_color=color
-            )
-            label_title.pack(anchor="w", padx=20, pady=(15, 5))
-            
-            label_pregunta = ctk.CTkLabel(
-                frame,
-                text=f"➤ {pregunta}",
-                font=("Segoe UI", 12, "bold"),
-                text_color="#333333",
-                anchor="w"
-            )
-            label_pregunta.pack(anchor="w", padx=20, pady=(5, 10), fill="x")
-            
-            for item in items:
-                label = ctk.CTkLabel(
-                    frame,
-                    text=f"  {item}",
-                    font=("Segoe UI", 11),
-                    text_color="#333333",
-                    anchor="w",
-                    justify="left"
-                )
-                label.pack(anchor="w", padx=25, pady=2, fill="x")
-            
-            ctk.CTkLabel(frame, text="", height=8).pack()
     
-    def _create_processes_tab_clean(self, parent):
-        """Tab de procesos con mensajes CLAROS y ÚTILES."""
-        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        title = ctk.CTkLabel(
-            scroll,
-            text="PROCESO DEL EQUIPO - ¿Para qué se usa este equipo?",
-            font=("Segoe UI", 17, "bold"),
-            text_color=COLOR_VERDE_HOSPITAL
-        )
-        title.pack(pady=(0, 15))
-        
-        intro = ctk.CTkLabel(
-            scroll,
-            text="Pregúntate: ¿Qué tipo de trabajo hacen en este equipo?",
-            font=("Segoe UI", 12, "italic"),
-            text_color="#666666"
-        )
-        intro.pack(pady=(0, 20))
-        
-        processes = [
-            ("🏥 MISIONAL", "#DC3545",
-             "Atiende pacientes directamente - Razón de ser del hospital",
-             [
-                "✓ Usa en: Áreas que atienden, diagnostican o tratan pacientes",
-                "✓ Usa en: Urgencias, UCI, Hospitalización, Quirófanos",
-                "✓ Usa en: Consulta Externa, Laboratorio, Imágenes",
-                "✓ Usa en: Farmacia, Bacteriología, Enfermería",
-                "✗ NO uses en: Oficinas o áreas que NO atienden pacientes",
-                "💡 Si en este equipo se trabaja CON pacientes → es MISIONAL"
-            ]),
-            ("📊 APOYO", "#17A2B8",
-             "Soporta las operaciones - Servicios necesarios",
-             [
-                "✓ Usa en: Áreas administrativas y de soporte",
-                "✓ Usa en: Facturación, Contabilidad, Recursos Humanos",
-                "✓ Usa en: Sistemas/IT, Archivo, Almacén",
-                "✓ Usa en: Mantenimiento, Servicios Generales, Seguridad",
-                "✗ NO uses en: Áreas que atienden pacientes directamente",
-                "💡 Si el trabajo es ADMINISTRATIVO u OPERATIVO → es APOYO"
-            ]),
-            ("🎯 ESTRATÉGICO", "#6F42C1",
-             "Dirige el hospital - Toma decisiones",
-             [
-                "✓ Usa SOLO en: Dirección General, Subdirección",
-                "✓ Usa en: Planeación Estratégica",
-                "✓ Usa en: Junta Directiva",
-                "✗ NO uses en: Personal operativo o coordinadores",
-                "💡 Si toma decisiones de ALTO NIVEL → es ESTRATÉGICO"
-            ]),
-            ("📋 EVALUACIÓN", "#FFC107",
-             "Controla y mejora - Mide resultados",
-             [
-                "✓ Usa en: Auditoría (interna y médica)",
-                "✓ Usa en: Calidad, Control Interno",
-                "✓ Usa en: Evaluación de Desempeño",
-                "✗ NO uses en: Operaciones diarias normales",
-                "💡 Si AUDITA o EVALÚA procesos → es EVALUACIÓN"
-            ])
-        ]
-        
-        for proc_name, color, pregunta, items in processes:
-            frame = ctk.CTkFrame(scroll, fg_color="#F5F5F5", corner_radius=10)
-            frame.pack(fill="x", pady=12, padx=5)
-            
-            label_title = ctk.CTkLabel(
-                frame,
-                text=proc_name,
-                font=("Segoe UI", 16, "bold"),
-                text_color=color
-            )
-            label_title.pack(anchor="w", padx=20, pady=(15, 5))
-            
-            label_pregunta = ctk.CTkLabel(
-                frame,
-                text=f"➤ {pregunta}",
-                font=("Segoe UI", 12, "bold"),
-                text_color="#333333",
-                anchor="w"
-            )
-            label_pregunta.pack(anchor="w", padx=20, pady=(5, 10), fill="x")
-            
-            for item in items:
-                label = ctk.CTkLabel(
-                    frame,
-                    text=f"  {item}",
-                    font=("Segoe UI", 11),
-                    text_color="#333333",
-                    anchor="w",
-                    justify="left"
-                )
-                label.pack(anchor="w", padx=25, pady=2, fill="x")
-            
-            ctk.CTkLabel(frame, text="", height=8).pack()
+    → Al terminar, puedes:
+        💾 GUARDAR: Solo datos manuales (rápido)
+        🔄 ACTUALIZAR: Modificar equipo existente
+        ➡️ CONTINUAR: Pasar a detección automática
+
+    2️⃣ RECOPILACIÓN AUTOMÁTICA
+    • Detección de hardware (WMI)
+        - Marca, Modelo, Serial del equipo, Discos
+    • Sistema operativo y arquitectura
+    • RAM y procesador
+    • Software instalado (Office, Teams, Outlook)
+    • Licencias de Windows y Office
+    • Red (IP, conexión)
+    • Seguridad (Antivirus, actualizaciones)
     
-    def _create_systems_tab_clean(self, parent):
-        """Tab de sistemas con mensajes CLAROS y ÚTILES."""
-        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=10, pady=10)
+    ⚠️ Este proceso tarda 10-30 segundos
+
+    3️⃣ VALIDACIÓN MIXTA
+    • Revisar y corregir datos detectados
+    • Agregar información de red (Switch, VLAN)
+    • Configurar acceso remoto (AnyDesk)
+    • Validar seguridad (Antivirus, Cifrado)
+
+    4️⃣ GUARDADO FINAL
+    • Se guardan TODAS las columnas en Excel
+    • Total: 85 columnas de información
+    • Archivo: inventario_hospital_v1.xlsx
+
+    🎯 RECOMENDACIONES
+
+    ✓ Completa campos obligatorios (marcados con *)
+    ✓ Usa GUARDAR si no necesitas detección automática
+    ✓ Usa RECOPILACIÓN AUTO para inventario completo
+    ✓ Puedes ACTUALIZAR equipos en cualquier momento
+    ✓ Pasa el mouse sobre preguntas para ver texto completo
+        """
         
-        title = ctk.CTkLabel(
+        label = ctk.CTkLabel(
             scroll,
-            text="SOFTWARE DEL EQUIPO - ¿Qué programas usa?",
-            font=("Segoe UI", 17, "bold"),
-            text_color=COLOR_VERDE_HOSPITAL
-        )
-        title.pack(pady=(0, 15))
-        
-        intro = ctk.CTkLabel(
-            scroll,
-            text="Marca lo que aplique para este equipo específico",
-            font=("Segoe UI", 12, "italic"),
-            text_color="#666666"
-        )
-        intro.pack(pady=(0, 20))
-        
-        systems = [
-            ("💻 SIHOS - Sistema de Información Hospitalaria", "#007BFF",
-             "El HIS principal del hospital - Historia clínica electrónica",
-             [
-                "🔵 LOCAL → Programa instalado en el equipo (versión completa)",
-                "   • Puede hacer TODO: registrar, consultar, reportes, configurar",
-                "   • Más rápido, funciona sin internet interno",
-                "",
-                "🌐 WEB → Entra por navegador (Chrome, Edge)",
-                "   • Solo consultas y algunas funciones según usuario",
-                "   • Requiere red funcionando",
-                "",
-                "❌ NO USA → Este equipo no necesita SIHOS",
-                "   • Típico en: oficinas administrativas, almacén, mantenimiento"
-            ]),
-            ("💊 SIFAX - Sistema de Dispensación Farmacéutica", "#28A745",
-             "Sistema de farmacia - Control de medicamentos",
-             [
-                "✓ SÍ → Este equipo tiene acceso a SIFAX",
-                "   • Típico en: Farmacia, Enfermería, Urgencias",
-                "",
-                "✗ NO → Este equipo NO usa SIFAX",
-                "   • Mayoría de equipos NO lo usan"
-            ]),
-            ("📄 Office Básico - Word, Excel, PowerPoint", "#FD7E14",
-             "Suite de oficina Microsoft",
-             [
-                "✓ SÍ → Necesita Office para trabajar",
-                "   • Hace documentos, reportes, presentaciones",
-                "   • Mayoría de equipos administrativos",
-                "",
-                "✗ NO → Solo usa sistemas específicos",
-                "   • Algunos equipos clínicos solo usan SIHOS"
-            ]),
-            ("🔧 Software Especializado", "#6F42C1",
-             "Programas específicos del área",
-             [
-                "✓ SÍ → Tiene software especial instalado",
-                "   • Ejemplos: PACS (imágenes), RIS (radiología), LIS (laboratorio)",
-                "   • Programas contables, nómina, facturación",
-                "   • ⚠ IMPORTANTE: Describe cuál en 'Descripción Software Esp.'",
-                "",
-                "✗ NO → Solo usa programas estándar",
-                "   • SIHOS, Office, navegador web"
-            ])
-        ]
-        
-        for sys_name, color, pregunta, items in systems:
-            frame = ctk.CTkFrame(scroll, fg_color="#F5F5F5", corner_radius=10)
-            frame.pack(fill="x", pady=12, padx=5)
-            
-            label_title = ctk.CTkLabel(
-                frame,
-                text=sys_name,
-                font=("Segoe UI", 15, "bold"),
-                text_color=color
-            )
-            label_title.pack(anchor="w", padx=20, pady=(15, 5))
-            
-            label_pregunta = ctk.CTkLabel(
-                frame,
-                text=f"➤ {pregunta}",
-                font=("Segoe UI", 11, "bold"),
-                text_color="#333333",
-                anchor="w"
-            )
-            label_pregunta.pack(anchor="w", padx=20, pady=(5, 10), fill="x")
-            
-            for item in items:
-                if item == "":  # Línea en blanco
-                    ctk.CTkLabel(frame, text="", height=3).pack()
-                else:
-                    label = ctk.CTkLabel(
-                        frame,
-                        text=f"  {item}",
-                        font=("Segoe UI", 10),
-                        text_color="#333333",
-                        anchor="w",
-                        justify="left"
-                    )
-                    label.pack(anchor="w", padx=25, pady=1, fill="x")
-            
-            ctk.CTkLabel(frame, text="", height=8).pack()
-    
-    def _create_others_tab_clean(self, parent):
-        """Tab otros con mensajes CLAROS y ÚTILES."""
-        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
-        scroll.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        # Sección 1: Horarios
-        frame1 = ctk.CTkFrame(scroll, fg_color="#F5F5F5", corner_radius=10)
-        frame1.pack(fill="x", pady=10, padx=5)
-        
-        ctk.CTkLabel(
-            frame1,
-            text="⏰ HORARIO DE USO - ¿Cuándo se usa este equipo?",
-            font=("Segoe UI", 16, "bold"),
-            text_color="#17A2B8"
-        ).pack(anchor="w", padx=20, pady=(15, 5))
-        
-        ctk.CTkLabel(
-            frame1,
-            text="➤ Selecciona el horario típico de trabajo en este equipo",
-            font=("Segoe UI", 11, "bold"),
-            text_color="#333333",
+            text=content,
+            font=("Consolas", 11),
+            justify="left",
             anchor="w"
-        ).pack(anchor="w", padx=20, pady=(5, 10), fill="x")
-        
-        horarios = [
-            "🔴 24/7 → TODO EL TIEMPO, sin parar",
-            "   • Urgencias, UCI, Hospitalización, Enfermería 24h",
-            "",
-            "🟠 Lunes-Viernes 7am-7pm → Jornada extendida",
-            "   • Consulta Externa, Facturación, Recepción",
-            "",
-            "🟡 Lunes-Viernes 7am-5pm → Horario administrativo normal",
-            "   • Oficinas, Contabilidad, RH, Archivo",
-            "",
-            "🔵 Turnos rotativos → Personal por turnos 24h",
-            "   • Enfermería por turnos, Personal asistencial rotativo",
-            "",
-            "🟢 Ocasional → Uso esporádico cuando se necesita",
-            "   • Almacén, Mantenimiento, Bodega"
-        ]
-        
-        for h in horarios:
-            if h == "":
-                ctk.CTkLabel(frame1, text="", height=3).pack()
-            else:
-                ctk.CTkLabel(
-                    frame1,
-                    text=f"  {h}",
-                    font=("Segoe UI", 10),
-                    text_color="#333333",
-                    anchor="w"
-                ).pack(anchor="w", padx=25, pady=1, fill="x")
-        
-        ctk.CTkLabel(frame1, text="", height=8).pack()
-        
-        # Sección 2: Estados Operativos
-        frame2 = ctk.CTkFrame(scroll, fg_color="#F5F5F5", corner_radius=10)
-        frame2.pack(fill="x", pady=10, padx=5)
-        
-        ctk.CTkLabel(
-            frame2,
-            text="⚙️ ESTADO OPERATIVO - ¿Cómo está funcionando?",
-            font=("Segoe UI", 16, "bold"),
-            text_color="#FD7E14"
-        ).pack(anchor="w", padx=20, pady=(15, 5))
-        
-        ctk.CTkLabel(
-            frame2,
-            text="➤ Describe el estado actual del equipo",
-            font=("Segoe UI", 11, "bold"),
-            text_color="#333333",
-            anchor="w"
-        ).pack(anchor="w", padx=20, pady=(5, 10), fill="x")
-        
-        estados = [
-            "✅ Operativo - Óptimo → Funciona perfecto, sin problemas",
-            "",
-            "⚠ Operativo - Regular → Funciona pero tiene fallas menores",
-            "   • A veces lento, se cuelga ocasionalmente, pero sirve",
-            "",
-            "⚠ Operativo - Deficiente → Funciona mal, necesita reparación pronto",
-            "   • Fallas frecuentes, muy lento, usuario se queja",
-            "",
-            "❌ Fuera de Servicio - Temporal → NO funciona, en reparación",
-            "   • Equipo apagado esperando reparación o repuesto",
-            "",
-            "❌ Fuera de Servicio - Permanente → Dañado sin reparación",
-            "   • Irreparable, se debe dar de baja",
-            "",
-            "🔧 En Reparación → Actualmente en mantenimiento",
-            "   • Con técnico, en taller, en proceso de reparación",
-            "",
-            "📦 En Bodega → Guardado, no en uso actualmente",
-            "   • Equipo funcionando pero almacenado, no asignado"
-        ]
-        
-        for e in estados:
-            if e == "":
-                ctk.CTkLabel(frame2, text="", height=3).pack()
-            else:
-                ctk.CTkLabel(
-                    frame2,
-                    text=f"  {e}",
-                    font=("Segoe UI", 10),
-                    text_color="#333333",
-                    anchor="w"
-                ).pack(anchor="w", padx=25, pady=1, fill="x")
-        
-        ctk.CTkLabel(frame2, text="", height=8).pack()
-        
-        # Sección 3: Referencias Normativas
-        frame3 = ctk.CTkFrame(scroll, fg_color="#F5F5F5", corner_radius=10)
-        frame3.pack(fill="x", pady=10, padx=5)
-        
-        ctk.CTkLabel(
-            frame3,
-            text="📖 REFERENCIAS NORMATIVAS",
-            font=("Segoe UI", 16, "bold"),
-            text_color=COLOR_VERDE_HOSPITAL
-        ).pack(anchor="w", padx=20, pady=(15, 10))
-        
-        normas = [
-            "MinTIC - PETI → Plan Estratégico de TI para entidades públicas",
-            "MinSalud Res. 2183/2004 → Estándares de calidad en salud",
-            "Ley 1581/2012 → Protección de Datos Personales (Habeas Data)",
-            "Decreto 1377/2013 → Reglamentación Ley 1581",
-            "MECI → Modelo Estándar de Control Interno para el Estado"
-        ]
-        
-        for n in normas:
-            ctk.CTkLabel(
-                frame3,
-                text=f"  • {n}",
-                font=("Segoe UI", 11),
-                text_color="#333333",
-                anchor="w"
-            ).pack(anchor="w", padx=25, pady=2, fill="x")
-        
-        ctk.CTkLabel(frame3, text="", height=8).pack()
-        """Crear contenido del tab de criticidad."""
+        )
+        label.pack(fill="both", padx=20, pady=10)
+
+    def _create_macroproceso_tab(self, parent):
+        """Tab de explicación de Macroproceso."""
         scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
         scroll.pack(fill="both", expand=True, padx=10, pady=10)
         
-        # Título
-        title = ctk.CTkLabel(
-            scroll,
-            text="NIVEL DE CRITICIDAD (MinTIC - PETI)",
-            font=("Segoe UI", 18, "bold"),
-            text_color=COLOR_VERDE_HOSPITAL
-        )
-        title.pack(pady=(0, 20))
-        
-        levels = [
-            ("🔴 CRÍTICO", "#DC3545", [
-                "Equipos cuya falla DETIENE operaciones vitales del hospital",
-                "Sistemas de información críticos: SIHOS, SIFAX",
-                "Áreas: Urgencias, UCI, Quirófanos",
-                "Disponibilidad: 24/7 sin interrupción",
-                "Tiempo máximo inactividad: < 1 hora",
-                "Ejemplos: PC Estación Enfermería UCI, Servidor SIHOS"
-            ]),
-            ("🟠 ALTO", "#FD7E14", [
-                "Equipos importantes para operaciones misionales",
-                "Afectan atención de pacientes directamente",
-                "Áreas: Hospitalización, Laboratorio, Imágenes",
-                "Disponibilidad: Horario extendido",
-                "Tiempo máximo inactividad: < 4 horas",
-                "Ejemplos: PC Laboratorio, PC Facturación, PC Farmacia"
-            ]),
-            ("🟡 MEDIO", "#FFC107", [
-                "Equipos de apoyo administrativo",
-                "Afectan eficiencia, NO bloquean operaciones",
-                "Áreas: Contabilidad, RH, Calidad",
-                "Disponibilidad: Horario laboral",
-                "Tiempo máximo inactividad: < 24 horas",
-                "Ejemplos: PC Contabilidad, PC Recursos Humanos"
-            ]),
-            ("🟢 BAJO", "#28A745", [
-                "Equipos de uso ocasional o no prioritario",
-                "NO afectan operaciones inmediatas",
-                "Áreas: Almacén, Servicios Generales",
-                "Disponibilidad: Ocasional",
-                "Tiempo máximo inactividad: > 24 horas",
-                "Ejemplos: PC Almacén, PC Mantenimiento"
-            ])
-        ]
-        
-        for level_name, color, items in levels:
-            frame = ctk.CTkFrame(scroll, fg_color=color, corner_radius=10)
-            frame.pack(fill="x", pady=10, padx=5)
-            
-            label_title = ctk.CTkLabel(
-                frame,
-                text=level_name,
-                font=("Segoe UI", 16, "bold"),
-                text_color="white"
-            )
-            label_title.pack(anchor="w", padx=15, pady=(15, 10))
-            
-            for item in items:
-                label = ctk.CTkLabel(
-                    frame,
-                    text=f"  • {item}",
-                    font=("Segoe UI", 12),
-                    text_color="white",
-                    anchor="w",
-                    justify="left"
-                )
-                label.pack(anchor="w", padx=20, pady=2, fill="x")
-            
-            ctk.CTkLabel(frame, text="", height=10).pack()  # Spacer
+        content = """
+    🏥 MACROPROCESO → PROCESO → SUBPROCESO
+
+    Esta estructura clasifica el equipo según el proceso hospitalario.
+    Las listas son CONDICIONALES (se actualizan automáticamente).
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    📊 ESTRATÉGICO (Dirección del hospital)
+    → GERENCIA
+        • Direccionamiento Estratégico
+        • Asignación de Recursos
+        • Evaluación y Desempeño
+        • Rendición de Cuentas
+        • Asesoría Jurídica
     
+    → PLANEACIÓN Y CALIDAD
+        • Seguridad del Paciente
+        • Epidemiología
+        • Estadística
+        • Formulación de Planes
+        • Revisión Documental
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    🏥 MISIONAL (Atención de pacientes)
+    → AMBULATORIA
+        • Consulta Externa
+        • Optometría
+        • Odontología
+        • Atención Hospitalizada
+        • Atención Quirúrgica
+    
+    → SOPORTE DIAGNÓSTICO
+        • Laboratorio Clínico
+        • Imágenes Diagnósticas
+        • Farmacia
+        • Fisioterapia
+        • Trabajo Social
+    
+    → URGENCIAS
+        • Atención de Urgencias
+        • Referencia y Contrarreferencia
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    🔧 APOYO (Soporte operativo)
+    → FINANCIERA
+        • Facturación, Contabilidad, Cartera
+    
+    → TALENTO HUMANO
+        • Recursos Humanos, Nómina
+    
+    → INFORMACIÓN Y COMUNICACIONES
+        • Sistemas, SIAU, Archivo
+    
+    → AMBIENTE FÍSICO Y TECNOLOGÍA
+        • Mantenimiento, Almacén, Servicios
+
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    📋 EVALUACIÓN Y CONTROL
+    → CONTROL INTERNO
+    → AUDITORÍA MÉDICA
+        """
+        
+        label = ctk.CTkLabel(
+            scroll,
+            text=content,
+            font=("Consolas", 10),
+            justify="left",
+            anchor="w"
+        )
+        label.pack(fill="both", padx=20, pady=10)
+
+    def _create_tips_tab(self, parent):
+        """Tab de tips para campos."""
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        content = """
+    💡 TIPS PARA LLENAR CAMPOS ESPECÍFICOS
+
+    📅 FECHAS (Formato: YYYY-MM-DD)
+    Ejemplo: 2024-01-15
+    • Fecha de Adquisición: Cuando se compró/recibió
+    • Fecha Venc. Garantía: Cuando vence la garantía
+    • Fecha Exp. Antivirus: Cuando vence la licencia
+    • Último Mantenimiento: Fecha del último mtto
+
+    💰 VALOR DE ADQUISICIÓN
+    • Solo números (sin puntos, comas ni símbolos)
+    • Ejemplo: 2500000 (dos millones quinientos mil pesos)
+
+    📋 CAMPOS OBLIGATORIOS (*)
+    • Tipo de Equipo, Área, Ubicación
+    • Responsable/Custodio
+    • Macroproceso, Proceso, Subproceso
+    • Uso SIHOS
+    • Estado Operativo
+
+    🔒 CUESTIONARIO (18 PREGUNTAS)
+    • Responde Sí o No según corresponda
+    • Pasa el mouse sobre cada pregunta para ver texto completo
+    • Si tienes dudas, consulta con supervisor
+    • Las respuestas se usan para clasificación posterior
+
+    🏥 SOFTWARE ESPECIALIZADO
+    • Marca "Sí" si usa programas especiales
+    • En "Descripción", especifica cuáles:
+        - PACS (Imágenes)
+        - RIS (Radiología)
+        - LIS (Laboratorio)
+        - Contable específico
+        - Otros sistemas propietarios
+
+    ⏰ HORARIO DE USO
+    • 24/7: Equipos que NUNCA se apagan (UCI, Urgencias)
+    • Lun-Vie 7am-7pm: Atención extendida
+    • Lun-Vie 7am-5pm: Horario administrativo
+
+    🔧 MANTENIMIENTO
+    • Periodicidad: Con qué frecuencia debe hacerse
+    • Responsable: Técnico asignado
+    • Último: Fecha del último realizado
+    • Tipo: Preventivo, Correctivo o Predictivo
+
+    ⚠️ ESTADO OPERATIVO
+    • Operativo - Óptimo: Funciona perfecto
+    • Operativo - Regular: Funciona con fallas menores
+    • Operativo - Deficiente: Funciona mal, necesita atención
+    • Fuera de Servicio: No funciona
+    • En Reparación: En proceso de arreglo
+        """
+        
+        label = ctk.CTkLabel(
+            scroll,
+            text=content,
+            font=("Consolas", 10),
+            justify="left",
+            anchor="w"
+        )
+        label.pack(fill="both", padx=20, pady=10)        
     
     def start_automatic_collection(self):
         """Iniciar recopilación automática."""
         # Validar campos obligatorios
         required = ['tipo_equipo', 'area_servicio', 'ubicacion_especifica',
-                   'responsable_custodio', 'proceso', 'uso_sihos', 'estado_operativo']
+           'responsable_custodio', 'macroproceso', 'proceso', 'subproceso',
+           'uso_sihos', 'estado_operativo']
         
         missing = []
         for field in required:
@@ -1794,38 +1731,50 @@ class InventoryManagerApp:
         self.verde_data['nombre_equipo'] = socket.gethostname()
         self.log_progress(f"   ✓ Nombre: {self.verde_data['nombre_equipo']}")
         
-        # 2-4. Hardware con WMI
+        # 2. Hardware con WMI (ACTUALIZADO)
         self.log_progress("\n💻 Detectando hardware con WMI...")
         hw_info = detect_hardware_wmi()
+        
+        # Equipo
         self.verde_data['marca'] = hw_info['marca']
         self.verde_data['modelo'] = hw_info['modelo']
         self.verde_data['serial'] = hw_info['serial']
-        self.verde_data['tipo_disco'] = hw_info['tipo_disco']
         
         self.log_progress(f"   ✓ Marca: {self.verde_data['marca']}")
         self.log_progress(f"   ✓ Modelo: {self.verde_data['modelo']}")
         self.log_progress(f"   ✓ Serial: {self.verde_data['serial']}")
-        self.log_progress(f"   ✓ Tipo Disco: {self.verde_data['tipo_disco']}")
         
-        # Disco secundario (si existe)
-        if hw_info['disco_secundario'] != 'No tiene':
-            self.log_progress(f"\n💿 Disco Secundario Detectado:")
-            self.log_progress(f"   ✓ Capacidad: {hw_info['disco_secundario']} GB")
-            self.log_progress(f"   ✓ Tipo: {hw_info['tipo_disco_secundario']}")
-            self.log_progress(f"   ✓ Serial: {hw_info['serial_disco_secundario']}")
-            self.log_progress(f"   ✓ Marca: {hw_info['marca_disco_secundario']}")
-            self.log_progress(f"   ✓ Modelo: {hw_info['modelo_disco_secundario']}")
+        # ===== DISCO 1 (PRIMARIO) - DETECCIÓN COMPLETA =====
+        self.log_progress(f"\n💿 Disco 1 (Primario):")
+        self.verde_data['disco1_capacidad'] = hw_info['disco1_capacidad']
+        self.verde_data['disco1_tipo'] = hw_info['disco1_tipo']
+        self.verde_data['disco1_serial'] = hw_info['disco1_serial']
+        self.verde_data['disco1_marca'] = hw_info['disco1_marca']
+        self.verde_data['disco1_modelo'] = hw_info['disco1_modelo']
+        
+        self.log_progress(f"   ✓ Capacidad: {hw_info['disco1_capacidad']} GB")
+        self.log_progress(f"   ✓ Tipo: {hw_info['disco1_tipo']}")
+        self.log_progress(f"   ✓ Serial: {hw_info['disco1_serial']}")
+        self.log_progress(f"   ✓ Marca: {hw_info['disco1_marca']}")
+        self.log_progress(f"   ✓ Modelo: {hw_info['disco1_modelo']}")
+        
+        # ===== DISCO 2 (SECUNDARIO) - DETECCIÓN COMPLETA =====
+        if hw_info['disco2_capacidad'] != 'No tiene':
+            self.log_progress(f"\n💿 Disco 2 (Secundario) Detectado:")
+            self.log_progress(f"   ✓ Capacidad: {hw_info['disco2_capacidad']} GB")
+            self.log_progress(f"   ✓ Tipo: {hw_info['disco2_tipo']}")
+            self.log_progress(f"   ✓ Serial: {hw_info['disco2_serial']}")
+            self.log_progress(f"   ✓ Marca: {hw_info['disco2_marca']}")
+            self.log_progress(f"   ✓ Modelo: {hw_info['disco2_modelo']}")
         else:
-            self.log_progress(f"\n💿 Disco Secundario: No detectado")
+            self.log_progress(f"\n💿 Disco 2 (Secundario): No detectado")
         
-        # Guardar info disco secundario para validación mixta
-        self.disco_secundario_info = {
-            'disco_secundario': hw_info['disco_secundario'],
-            'tipo_disco_secundario': hw_info['tipo_disco_secundario'],
-            'serial_disco_secundario': hw_info['serial_disco_secundario'],
-            'marca_disco_secundario': hw_info['marca_disco_secundario'],
-            'modelo_disco_secundario': hw_info['modelo_disco_secundario']
-        }
+        # Guardar disco 2 para validación mixta
+        self.verde_data['disco2_capacidad'] = hw_info['disco2_capacidad']
+        self.verde_data['disco2_tipo'] = hw_info['disco2_tipo']
+        self.verde_data['disco2_serial'] = hw_info['disco2_serial']
+        self.verde_data['disco2_marca'] = hw_info['disco2_marca']
+        self.verde_data['disco2_modelo'] = hw_info['disco2_modelo']
         
         # 5-7. Sistema Operativo
         self.log_progress("\n🪟 Sistema Operativo...")
@@ -2058,7 +2007,7 @@ class InventoryManagerApp:
         self.show_completion_message()
     
     def save_to_excel(self):
-        """Guardar TODOS los datos en Excel (NARANJAS + VERDES + AZULES)."""
+        """Guardar TODOS los datos en Excel."""
         if not HAS_OPENPYXL:
             messagebox.showerror("Error", "Necesitas instalar openpyxl")
             return
@@ -2067,51 +2016,89 @@ class InventoryManagerApp:
             wb = load_workbook(self.excel_path)
             ws = wb["Equipos de Cómputo"]
             
-            # Verificar si estamos en modo ACTUALIZACIÓN o GUARDAR NUEVO
+            # Verificar modo
             if hasattr(self, 'equipo_update_row') and self.equipo_update_row:
                 # MODO ACTUALIZACIÓN
                 row = self.equipo_update_row
                 codigo = self.equipo_update_code
-                consecutive = int(codigo.split('-')[1])  # Extraer número del código EQC-0142
-                
-                # NO se modifican las columnas 1 y 2 (Consecutivo y Código ya existen)
-                
+                consecutive = int(codigo.split('-')[1])
             else:
                 # MODO GUARDAR NUEVO
                 row = self.current_row
                 consecutive = row - 1
-                
-                # Columna 1: N° Consecutivo
                 ws.cell(row=row, column=1, value=consecutive)
-                
-                # Columna 2: Código Inventario
                 ws.cell(row=row, column=2, value=f"EQC-{consecutive:04d}")
             
             # ===== COLUMNA 3: Nombre Equipo (VERDE) =====
             ws.cell(row=row, column=3, value=self.verde_data.get('nombre_equipo', ''))
             
-            # ===== COLUMNAS 4-27: NARANJAS (24 campos) =====
+            # ===== COLUMNAS 4-50: NARANJAS (DATOS MANUALES) =====
             col = 4
-            naranja_fields = [
-                'tipo_equipo', 'area_servicio', 'ubicacion_especifica',
-                'responsable_custodio', 'proceso', 'uso_sihos', 'uso_sifax',
-                'uso_office_basico', 'software_especializado', 'descripcion_software',
-                'funcion_principal', 'criticidad', 'confidencialidad',
-                'horario_uso', 'estado_operativo', 'fecha_adquisicion',
-                'valor_adquisicion', 'fecha_venc_garantia', 'observaciones_tecnicas',
-                'fecha_exp_antivirus', 'periodicidad_mtto', 'responsable_mtto',
-                'ultimo_mantenimiento', 'tipo_ultimo_mtto'
+            
+            # Campos básicos (8)
+            basic_fields = [
+                'tipo_equipo', 'area_servicio', 'ubicacion_especifica', 'responsable_custodio',
+                'macroproceso', 'proceso', 'subproceso',  # ← NUEVOS CAMPOS JERÁRQUICOS
+                'uso_sihos'
             ]
             
-            for field in naranja_fields:
+            for field in basic_fields:
                 value = self.equipment_data.get(field, '')
                 ws.cell(row=row, column=col, value=value)
                 col += 1
             
-            # ===== COLUMNAS 28-48: VERDES (21 campos más) =====
+            # Campos software (4)
+            software_fields = ['uso_sifax', 'uso_office_basico', 'software_especializado', 'descripcion_software']
+            for field in software_fields:
+                value = self.equipment_data.get(field, '')
+                ws.cell(row=row, column=col, value=value)
+                col += 1
+            
+            # Función principal (1)
+            ws.cell(row=row, column=col, value=self.equipment_data.get('funcion_principal', ''))
+            col += 1
+            
+            # ===== CUESTIONARIO DE CLASIFICACIÓN (18 PREGUNTAS) =====
+            # 9 Confidencialidad
+            for i in range(1, 10):
+                value = self.equipment_data.get(f'conf_{i}', '')
+                ws.cell(row=row, column=col, value=value)
+                col += 1
+            
+            # 3 Integridad
+            for i in range(1, 4):
+                value = self.equipment_data.get(f'int_{i}', '')
+                ws.cell(row=row, column=col, value=value)
+                col += 1
+            
+            # 6 Criticidad
+            for i in range(1, 7):
+                value = self.equipment_data.get(f'crit_{i}', '')
+                ws.cell(row=row, column=col, value=value)
+                col += 1
+            
+            # Campos finales (9)
+            final_fields = [
+                'horario_uso', 'estado_operativo', 'fecha_adquisicion', 'valor_adquisicion',
+                'fecha_venc_garantia', 'observaciones_tecnicas', 'fecha_exp_antivirus',
+                'periodicidad_mtto', 'responsable_mtto', 'ultimo_mantenimiento', 'tipo_ultimo_mtto'
+            ]
+            for field in final_fields:
+                value = self.equipment_data.get(field, '')
+                ws.cell(row=row, column=col, value=value)
+                col += 1
+            
+            # TOTAL NARANJAS: 8 + 4 + 1 + 18 + 11 = 42 columnas
+            
+            # ===== COLUMNAS VERDES (HARDWARE Y SOFTWARE) =====
             verde_fields = [
                 'marca', 'modelo', 'serial', 'sistema_operativo', 'arquitectura_so',
-                'procesador', 'ram_gb', 'almacenamiento_gb', 'tipo_disco',
+                'procesador', 'ram_gb',
+                # DISCO 1 (5 campos)
+                'disco1_capacidad', 'disco1_tipo', 'disco1_serial', 'disco1_marca', 'disco1_modelo',
+                # DISCO 2 (5 campos)
+                'disco2_capacidad', 'disco2_tipo', 'disco2_serial', 'disco2_marca', 'disco2_modelo',
+                # Resto
                 'uso_navegador_web', 'version_office', 'licencia_office',
                 'uso_teams', 'uso_outlook', 'licencia_windows', 'key_windows',
                 'estado_licencia_windows', 'direccion_ip', 'tipo_conexion',
@@ -2123,12 +2110,8 @@ class InventoryManagerApp:
                 ws.cell(row=row, column=col, value=value)
                 col += 1
             
-            # ===== COLUMNAS 49-61: AZULES (12 campos mixtos con disco secundario) =====
+            # ===== COLUMNAS AZULES (MIXTAS) =====
             azul_fields = [
-                # Disco secundario (5 campos)
-                'disco_secundario', 'tipo_disco_secundario', 'serial_disco_secundario',
-                'marca_disco_secundario', 'modelo_disco_secundario',
-                # Otros campos mixtos (7 campos)
                 'switch_puerto', 'vlan_asignada', 'id_anydesk',
                 'otro_acceso_remoto', 'estado_antivirus',
                 'cifrado_disco', 'tipo_usuario_local'
@@ -2139,8 +2122,7 @@ class InventoryManagerApp:
                 ws.cell(row=row, column=col, value=value)
                 col += 1
             
-            # ===== COLUMNA 62: Antigüedad (CALCULADA - BLANCA) =====
-            # Calcular antigüedad si hay fecha de adquisición
+            # ===== COLUMNA FINAL: Antigüedad (CALCULADA) =====
             fecha_adq = self.equipment_data.get('fecha_adquisicion', '')
             if fecha_adq:
                 try:
@@ -2155,137 +2137,214 @@ class InventoryManagerApp:
             wb.save(self.excel_path)
             wb.close()
             
-            # Verificar si fue actualización o guardar nuevo
+            # Mensaje según modo
             if hasattr(self, 'equipo_update_row') and self.equipo_update_row:
-                # MODO ACTUALIZACIÓN - Mensaje y reseteo completo
                 messagebox.showinfo("Éxito", f"✅ Equipo {codigo} actualizado correctamente (datos completos)")
-                
-                # Reseteo completo usando función unificada
                 self.reset_after_update_equipos()
-                
             else:
-                # MODO GUARDAR NUEVO - Flujo normal
                 messagebox.showinfo("Éxito", f"✅ Equipo guardado: EQC-{consecutive:04d}")
-                
-                # Actualizar para siguiente equipo
                 self.current_row += 1
-                
-                # IMPORTANTE: Recrear formulario completo para que botón automático siempre funcione
                 self.root.after(100, self.show_manual_form_in_container)
-            
+                
         except Exception as e:
             messagebox.showerror("Error", f"Error al guardar en Excel:\n{e}")
     
     def save_equipo_manual_only(self):
-        """Guardar solo datos manuales del equipo (sin detección automática)."""
-        if not HAS_OPENPYXL:
-            messagebox.showerror("Error", "Necesitas instalar openpyxl")
-            return
+        """Guardar solo datos manuales (sin recopilación automática).        """
+        # ===== VALIDACIÓN DE CAMPOS OBLIGATORIOS =====
+        required_fields = {
+            'tipo_equipo': 'Tipo de Equipo',
+            'area_servicio': 'Área / Servicio',
+            'ubicacion_especifica': 'Ubicación Específica',
+            'responsable_custodio': 'Responsable / Custodio',
+            'macroproceso': 'Macroproceso',
+            'proceso': 'Proceso',
+            'subproceso': 'Subproceso',
+            'uso_sihos': 'Uso SIHOS',
+            'estado_operativo': 'Estado Operativo'
+        }
         
-        # Verificar si es actualización o nuevo registro
-        if hasattr(self, 'equipo_update_row') and self.equipo_update_row:
-            # MODO ACTUALIZACIÓN
-            self.save_equipo_update()
-            return
+        missing_fields = []
         
-        # MODO GUARDAR NUEVO
-        try:
-            # PRIMERO: Leer todos los valores ANTES de hacer cualquier cosa
-            datos_guardados = {}
-            naranja_fields = [
-                'tipo_equipo', 'area_servicio', 'ubicacion_especifica',
-                'responsable_custodio', 'proceso', 'uso_sihos', 'uso_sifax',
-                'uso_office_basico', 'software_especializado', 'descripcion_software',
-                'funcion_principal', 'criticidad', 'confidencialidad',
-                'horario_uso', 'estado_operativo', 'fecha_adquisicion',
-                'valor_adquisicion', 'fecha_venc_garantia', 'observaciones_tecnicas',
-                'fecha_exp_antivirus', 'periodicidad_mtto', 'responsable_mtto',
-                'ultimo_mantenimiento', 'tipo_ultimo_mtto'
-            ]
-            
-            for field in naranja_fields:
+        for field_name, field_label in required_fields.items():
+            if field_name in self.manual_widgets:
+                widget = self.manual_widgets[field_name]
                 try:
-                    if field in self.manual_widgets:
-                        widget = self.manual_widgets[field]
-                        if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
-                            if isinstance(widget, ctk.CTkEntry):
-                                datos_guardados[field] = widget.get()
-                            elif isinstance(widget, ctk.CTkComboBox):
-                                datos_guardados[field] = widget.get()
-                            else:
-                                datos_guardados[field] = ''
+                    if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
+                        if isinstance(widget, (ctk.CTkEntry, ctk.CTkComboBox)):
+                            value = widget.get().strip()
+                        elif isinstance(widget, tk.StringVar):
+                            value = widget.get().strip()
                         else:
-                            datos_guardados[field] = ''
+                            value = ''
+                        
+                        if not value:
+                            missing_fields.append(field_label)
                     else:
-                        datos_guardados[field] = ''
+                        missing_fields.append(field_label)
                 except:
-                    datos_guardados[field] = ''
+                    missing_fields.append(field_label)
+            else:
+                missing_fields.append(field_label)
+        
+        if missing_fields:
+            messagebox.showwarning(
+                "Campos Requeridos",
+                f"Por favor completa los siguientes campos obligatorios:\n\n" + 
+                "\n".join(f"• {field}" for field in missing_fields)
+            )
+            return
+        
+        # ===== RECOPILAR DATOS MANUALES =====
+        datos_guardados = {}
+        
+        for field_name, widget in self.manual_widgets.items():
+            try:
+                if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
+                    # Entry (campos de texto)
+                    if isinstance(widget, ctk.CTkEntry):
+                        datos_guardados[field_name] = widget.get()
+                    
+                    # ComboBox (listas desplegables)
+                    elif isinstance(widget, ctk.CTkComboBox):
+                        datos_guardados[field_name] = widget.get()
+                    
+                    # StringVar (RadioButtons) ← NUEVO
+                    elif isinstance(widget, tk.StringVar):
+                        datos_guardados[field_name] = widget.get()
+                    
+                    else:
+                        datos_guardados[field_name] = ''
+                else:
+                    datos_guardados[field_name] = ''
+            except Exception as e:
+                print(f"Error al obtener valor de {field_name}: {e}")
+                datos_guardados[field_name] = ''
+        
+        # ===== GUARDAR EN EXCEL =====
+        try:
+            # Abrir Excel
+            if not os.path.exists(EXCEL_FILE):
+                messagebox.showerror("Error", f"No se encontró el archivo: {EXCEL_FILE}")
+                return
             
-            # SEGUNDO: Guardar en Excel
-            wb = load_workbook(self.excel_path)
-            ws = wb["Equipos de Cómputo"]
+            wb = openpyxl.load_workbook(EXCEL_FILE)
             
-            row = self.current_row
-            consecutive = row - 1
+            if SHEET_EQUIPOS not in wb.sheetnames:
+                messagebox.showerror("Error", f"No se encontró la hoja: {SHEET_EQUIPOS}")
+                return
             
-            # Columna 1: N° Consecutivo
-            ws.cell(row=row, column=1, value=consecutive)
+            ws = wb[SHEET_EQUIPOS]
             
-            # Columna 2: Código Inventario
-            ws.cell(row=row, column=2, value=f"EQC-{consecutive:04d}")
+            # Obtener siguiente consecutivo y código
+            next_consecutivo = self.get_next_consecutivo()
+            next_codigo = self.get_next_codigo()
             
-            # Columna 3: Nombre Equipo (vacío en guardado manual)
-            ws.cell(row=row, column=3, value='')
+            # Nueva fila
+            nueva_fila = ws.max_row + 1
             
-            # ===== COLUMNAS 4-27: NARANJAS (24 campos) =====
-            col = 4
-            for field in naranja_fields:
-                value = datos_guardados.get(field, '')
-                ws.cell(row=row, column=col, value=value)
-                col += 1
+            # ===== MAPEO A 85 COLUMNAS =====
             
-            # Columnas 28-61: vacías (verdes y azules incluyendo disco secundario)
-            for i in range(28, 62):
-                ws.cell(row=row, column=i, value='')
+            # Cols 1-2: Identificación
+            ws.cell(row=nueva_fila, column=1).value = next_consecutivo  # N° Consecutivo
+            ws.cell(row=nueva_fila, column=2).value = next_codigo       # Código
+            
+            # Col 3: Nombre Equipo (VERDE - se llenará después)
+            ws.cell(row=nueva_fila, column=3).value = ''  # Vacío por ahora
+            
+            # Cols 4-7: Básicos (NARANJA)
+            ws.cell(row=nueva_fila, column=4).value = datos_guardados.get('tipo_equipo', '')
+            ws.cell(row=nueva_fila, column=5).value = datos_guardados.get('area_servicio', '')
+            ws.cell(row=nueva_fila, column=6).value = datos_guardados.get('ubicacion_especifica', '')
+            ws.cell(row=nueva_fila, column=7).value = datos_guardados.get('responsable_custodio', '')
+            
+            # Cols 8-10: Macroproceso/Proceso/Subproceso (NARANJA)
+            ws.cell(row=nueva_fila, column=8).value = datos_guardados.get('macroproceso', '')
+            ws.cell(row=nueva_fila, column=9).value = datos_guardados.get('proceso', '')
+            ws.cell(row=nueva_fila, column=10).value = datos_guardados.get('subproceso', '')
+            
+            # Cols 11-16: Software (NARANJA)
+            ws.cell(row=nueva_fila, column=11).value = datos_guardados.get('uso_sihos', '')
+            ws.cell(row=nueva_fila, column=12).value = datos_guardados.get('uso_sifax', '')
+            ws.cell(row=nueva_fila, column=13).value = datos_guardados.get('uso_office_basico', '')
+            ws.cell(row=nueva_fila, column=14).value = datos_guardados.get('software_especializado', '')
+            ws.cell(row=nueva_fila, column=15).value = datos_guardados.get('descripcion_software', '')
+            ws.cell(row=nueva_fila, column=16).value = datos_guardados.get('funcion_principal', '')
+            
+            # Cols 17-34: Cuestionario 18 preguntas (NARANJA)
+            # CONFIDENCIALIDAD (9)
+            for i in range(1, 10):
+                ws.cell(row=nueva_fila, column=16 + i).value = datos_guardados.get(f'conf_{i}', '')
+            
+            # INTEGRIDAD (3)
+            for i in range(1, 4):
+                ws.cell(row=nueva_fila, column=25 + i).value = datos_guardados.get(f'int_{i}', '')
+            
+            # CRITICIDAD (6)
+            for i in range(1, 7):
+                ws.cell(row=nueva_fila, column=28 + i).value = datos_guardados.get(f'crit_{i}', '')
+            
+            # Cols 35-46: Operativos (NARANJA)
+            ws.cell(row=nueva_fila, column=35).value = datos_guardados.get('horario_uso', '')
+            ws.cell(row=nueva_fila, column=36).value = datos_guardados.get('estado_operativo', '')
+            ws.cell(row=nueva_fila, column=37).value = datos_guardados.get('fecha_adquisicion', '')
+            ws.cell(row=nueva_fila, column=38).value = datos_guardados.get('valor_adquisicion', '')
+            ws.cell(row=nueva_fila, column=39).value = datos_guardados.get('fecha_venc_garantia', '')
+            ws.cell(row=nueva_fila, column=40).value = datos_guardados.get('observaciones_tecnicas', '')
+            ws.cell(row=nueva_fila, column=41).value = datos_guardados.get('fecha_exp_antivirus', '')
+            ws.cell(row=nueva_fila, column=42).value = datos_guardados.get('periodicidad_mtto', '')
+            ws.cell(row=nueva_fila, column=43).value = datos_guardados.get('responsable_mtto', '')
+            ws.cell(row=nueva_fila, column=44).value = datos_guardados.get('ultimo_mantenimiento', '')
+            ws.cell(row=nueva_fila, column=45).value = datos_guardados.get('tipo_ultimo_mtto', '')
+            ws.cell(row=nueva_fila, column=46).value = datos_guardados.get('reservada', '')
+            
+            # Cols 47-77: Hardware/Software (VERDE) - Vacíos por ahora
+            for col in range(47, 78):
+                ws.cell(row=nueva_fila, column=col).value = ''
+            
+            # Cols 78-84: Mixtos (AZUL) - Vacíos por ahora
+            for col in range(78, 85):
+                ws.cell(row=nueva_fila, column=col).value = ''
+            
+            # Col 85: Antigüedad - Vacío por ahora
+            ws.cell(row=nueva_fila, column=85).value = ''
             
             # Guardar
-            wb.save(self.excel_path)
+            wb.save(EXCEL_FILE)
             wb.close()
             
-            messagebox.showinfo("Éxito", f"✅ Equipo guardado (solo datos manuales): EQC-{consecutive:04d}")
+            messagebox.showinfo(
+                "Éxito",
+                f"Equipo guardado exitosamente:\n\n" +
+                f"Código: {next_codigo}\n" +
+                f"Tipo: {datos_guardados.get('tipo_equipo', '')}\n" +
+                f"Área: {datos_guardados.get('area_servicio', '')}\n\n" +
+                f"Los datos de hardware se pueden agregar después con 'Recopilación Automática'."
+            )
             
-            # Actualizar para siguiente equipo
-            self.current_row += 1
-            
-            # IMPORTANTE: Recrear formulario para que el botón automático funcione
-            self.root.after(100, self.show_manual_form_in_container)
-            
-            # TERCERO: Actualizar título
-            if hasattr(self, 'equipo_form_frame'):
+            # Limpiar formulario
+            for widget in self.manual_widgets.values():
                 try:
-                    if hasattr(self.equipo_form_frame, 'winfo_exists') and self.equipo_form_frame.winfo_exists():
-                        self.equipo_form_frame.configure(
-                            label_text=f"📝 DATOS MANUALES - Equipo #{self.current_row-1} (Código EQC-{self.current_row-1:04d})"
-                        )
+                    if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
+                        if isinstance(widget, ctk.CTkEntry):
+                            widget.delete(0, 'end')
+                        elif isinstance(widget, ctk.CTkComboBox):
+                            widget.set('')
+                        elif isinstance(widget, tk.StringVar):
+                            widget.set('')
                 except:
                     pass
             
-            # CUARTO: Limpiar campos selectivamente (con verificación)
-            campos_a_mantener = ['area_servicio', 'proceso', 'responsable_custodio', 'periodicidad_mtto', 'responsable_mtto']
+            # Recargar tabla
+            self.load_data()
             
-            for key, widget in self.manual_widgets.items():
-                if key not in campos_a_mantener:
-                    try:
-                        if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
-                            if isinstance(widget, ctk.CTkEntry):
-                                widget.delete(0, "end")
-                            elif isinstance(widget, ctk.CTkComboBox):
-                                widget.set("")
-                    except:
-                        pass
-                    
         except Exception as e:
-            messagebox.showerror("Error", f"Error al guardar:\n{e}")
+            messagebox.showerror(
+                "Error al Guardar",
+                f"Ocurrió un error al guardar los datos:\n\n{str(e)}"
+            )
+            import traceback
+            traceback.print_exc()
     
     def update_equipo_computo(self):
         """Actualizar equipo de cómputo existente."""
@@ -3933,7 +3992,7 @@ Total: 56 columnas completas
             self.baja_next = next_baja
             self.baja_scroll.configure(label_text=f"📦 EQUIPOS DADOS DE BAJA - Baja #{next_baja}")
             
-            # Limpiar campos selectivamente (mantener responsable, motivo y destino)
+            # Limpiar campos selectivamente
             campos_a_mantener = ['responsable', 'motivo', 'destino']
             
             for key, widget in self.baja_widgets.items():
