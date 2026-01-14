@@ -62,7 +62,7 @@ except ImportError:
 
 # PIL para cargar imágenes (logo)
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -644,7 +644,7 @@ class InventoryManagerApp:
             title_frame,
             text=f"📝 DATOS MANUALES - Equipo #1 ({codigo_text})",
             font=("Segoe UI", 16, "bold"),
-            text_color=COLOR_VERDE_HOSPITAL
+            text_color="white"
         )
         title_label.pack(pady=15)
         
@@ -955,7 +955,7 @@ class InventoryManagerApp:
             return 2
     
     def create_header(self):
-        """Crear encabezado."""
+        """Crear encabezado con logo en círculo blanco.        """
         header_frame = ctk.CTkFrame(self.root, fg_color=COLOR_VERDE_HOSPITAL, corner_radius=0)
         header_frame.pack(fill="x", padx=0, pady=0)
         
@@ -963,12 +963,11 @@ class InventoryManagerApp:
         content_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
         content_frame.pack(pady=18)
         
-        # Cargar logo
+        # Intentar cargar logo
         if HAS_PIL:
             logo_paths = [
                 "logo_hospital.png",
                 "logo.png", 
-                "escudo_hospital.png",
                 "hospital_logo.png"
             ]
             
@@ -977,61 +976,36 @@ class InventoryManagerApp:
                     try:
                         from PIL import Image, ImageDraw
                         
-                        # 1. Cargar logo
+                        # 1. Cargar logo original (SIN MODIFICARLO)
                         logo_original = Image.open(logo_path)
                         
-                        # 2. Convertir a RGBA (con transparencia)
+                        # 2. Convertir a RGBA si no lo es
                         if logo_original.mode != 'RGBA':
                             logo_original = logo_original.convert('RGBA')
                         
-                        # 3. ELIMINAR FONDO DEL LOGO (hacer transparente)
-                        # Detectar color predominante (probablemente verde o blanco)
-                        logo_data = logo_original.getdata()
-                        new_data = []
-                        
-                        for item in logo_data:
-                            # Si el píxel es muy verde o muy blanco, hacerlo transparente
-                            # Verde hospital: aproximadamente RGB(46, 125, 50)
-                            r, g, b = item[:3]
-                            
-                            # Condición: píxel verde o blanco → transparente
-                            es_verde = (g > r + 20 and g > b + 20 and g > 100)  # Verde predominante
-                            es_blanco = (r > 240 and g > 240 and b > 240)  # Casi blanco
-                            
-                            if es_verde or es_blanco:
-                                # Hacer transparente
-                                new_data.append((r, g, b, 0))
-                            else:
-                                # Mantener píxel original
-                                new_data.append(item)
-                        
-                        logo_sin_fondo = Image.new('RGBA', logo_original.size)
-                        logo_sin_fondo.putdata(new_data)
-                        
-                        # 4. Redimensionar logo limpio
-                        aspect_ratio = logo_sin_fondo.width / logo_sin_fondo.height
-                        new_height = 60  # Más pequeño para que quepa bien
+                        # 3. Redimensionar logo
+                        aspect_ratio = logo_original.width / logo_original.height
+                        new_height = 65
                         new_width = int(new_height * aspect_ratio)
-                        logo_limpio = logo_sin_fondo.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                        logo_resized = logo_original.resize((new_width, new_height), Image.Resampling.LANCZOS)
                         
-                        # 5. Crear círculo blanco de fondo
-                        circle_size = 85
+                        # 4. Crear círculo blanco de fondo
+                        circle_size = 90
                         background = Image.new('RGBA', (circle_size, circle_size), (0, 0, 0, 0))
                         
                         # Dibujar círculo blanco sólido
                         draw = ImageDraw.Draw(background)
                         draw.ellipse([0, 0, circle_size-1, circle_size-1], 
-                                    fill=(255, 255, 255, 255), 
-                                    outline=None)
+                                    fill=(255, 255, 255, 255))
                         
-                        # 6. Centrar logo LIMPIO sobre círculo blanco
+                        # 5. Centrar logo sobre círculo blanco (SIN MODIFICAR PÍXELES DEL LOGO)
                         x_offset = (circle_size - new_width) // 2
                         y_offset = (circle_size - new_height) // 2
                         
-                        # Pegar logo (con transparencia)
-                        background.paste(logo_limpio, (x_offset, y_offset), logo_limpio)
+                        # Pegar logo directamente (respetando su transparencia original)
+                        background.paste(logo_resized, (x_offset, y_offset), logo_resized)
                         
-                        # 7. Convertir a CTkImage
+                        # 6. Convertir a CTkImage
                         logo_ctk = ctk.CTkImage(
                             light_image=background, 
                             dark_image=background, 
@@ -1044,13 +1018,11 @@ class InventoryManagerApp:
                             text=""
                         )
                         logo_label.pack(side="left", padx=(0, 25))
-                        print(f"✓ Logo limpio y transparente: {logo_path}")
+                        print(f"✓ Logo cargado en círculo blanco: {logo_path}")
                         break
                         
                     except Exception as e:
                         print(f"✗ Error al cargar logo {logo_path}: {e}")
-                        import traceback
-                        traceback.print_exc()
         
         # Texto del header
         text_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
@@ -1072,9 +1044,10 @@ class InventoryManagerApp:
         )
         subtitle_label.pack(pady=(2, 0))
         
+        # Status label
         self.status_label = ctk.CTkLabel(
             header_frame,
-            text="",
+            text="HOLA",
             font=("Segoe UI", 10),
             text_color="white",
             fg_color="transparent"
@@ -1226,40 +1199,60 @@ class InventoryManagerApp:
         next_row = self.get_next_available_row("Equipos Dados de Baja", check_column=1, max_rows=200)
         return next_row - 1
     
-    def create_form_field(self, parent, label_text, field_name, field_type, options, tooltip_text=None):
-        """Crear campo CENTRADO con mejor distribución de espacio."""
-        # Frame principal - CENTRADO
-        field_frame = ctk.CTkFrame(parent, fg_color="white", corner_radius=8)
-        field_frame.pack(fill="x", padx=40, pady=6)  # Más padding lateral = más centrado
+    def create_form_field_centered(self, parent, label_text, field_name, field_type, 
+                               options=None, tooltip_text=None):
+        """
+        Crear campo centrado.
         
-        # Frame interno - Grid layout para mejor control
+        Args:
+            parent: Frame padre donde se creará el campo
+            label_text: Texto del label (izquierda)
+            field_name: Nombre del campo (key en self.manual_widgets)
+            field_type: "entry" o "combobox"
+            options: Lista de opciones para combobox (opcional)
+            tooltip_text: Texto del tooltip al pasar mouse (opcional)
+        
+        Returns:
+            widget: El widget creado (Entry o ComboBox)
+        
+        Grid:
+            - Columna 0 (Label): 60% peso, alineado izquierda
+            - Columna 1 (Widget): 40% peso, ancho fijo 300px
+            - Espacio entre columnas: 30px
+        """
+        # Frame principal - CENTRADO con padding lateral
+        field_frame = ctk.CTkFrame(parent, fg_color="white", corner_radius=8)
+        field_frame.pack(fill="x", padx=40, pady=6)
+        
+        # Frame interno - Grid layout con espacio
         inner_frame = ctk.CTkFrame(field_frame, fg_color="transparent")
         inner_frame.pack(fill="x", padx=20, pady=10)
         
-        # Configurar grid (2 columnas)
-        inner_frame.grid_columnconfigure(0, weight=6)  # Label: 60%
-        inner_frame.grid_columnconfigure(1, weight=4)  # Widget: 40%
+        # Configurar grid (2 columnas con espacio)
+        inner_frame.grid_columnconfigure(0, weight=6)  # Label: flexible
+        inner_frame.grid_columnconfigure(1, weight=0, minsize=300)  # Widget: fijo 300px
         
-        # Label (columna 0)
+        # ===== LABEL (COLUMNA 0) =====
         label = ctk.CTkLabel(
             inner_frame,
             text=label_text,
             font=("Segoe UI", 12, "bold"),
-            anchor="w",
+            anchor="w",  # Alineado a la izquierda
             text_color="#333333"
         )
-        label.grid(row=0, column=0, sticky="w", padx=(0, 15))
+        label.grid(row=0, column=0, sticky="w", padx=(0, 30))  # 30px espacio a la derecha
         
-        # Tooltip
+        # Tooltip si existe
         if tooltip_text:
             ToolTip(label, tooltip_text)
         
-        # Widget (columna 1)
+        # ===== WIDGET (COLUMNA 1) - ANCHO FIJO =====
         if field_type == "combobox":
             widget = ctk.CTkComboBox(
                 inner_frame,
                 values=options if options else [],
                 height=35,
+                width=300,  # ← ANCHO FIJO 300px
                 font=("Segoe UI", 11),
                 dropdown_font=("Segoe UI", 10),
                 border_color="#CCCCCC",
@@ -1267,25 +1260,27 @@ class InventoryManagerApp:
                 button_hover_color="#1F5A32",
                 corner_radius=8
             )
-            widget.grid(row=0, column=1, sticky="ew")  # "ew" = expand horizontalmente
+            widget.grid(row=0, column=1, sticky="e")  # Alineado a la derecha de su columna
             
         elif field_type == "entry":
             widget = ctk.CTkEntry(
                 inner_frame,
                 height=35,
+                width=300,  # ← ANCHO FIJO 300px
                 font=("Segoe UI", 11),
                 border_color="#CCCCCC",
                 fg_color="white",
                 corner_radius=8
             )
-            widget.grid(row=0, column=1, sticky="ew")
+            widget.grid(row=0, column=1, sticky="e")  # Alineado a la derecha de su columna
         
+        # Guardar widget
         self.manual_widgets[field_name] = widget
         return widget
     
     def create_radio_field_centered(self, parent, label_text, field_name, tooltip_text=None):
         """
-        Crear campo con RadioButtons CENTRADO (para preguntas Sí/No).
+        Crear campo con RadioButtons (para preguntas Sí/No).
         """
         # Frame principal - CENTRADO
         field_frame = ctk.CTkFrame(parent, fg_color="white", corner_radius=8)
@@ -1295,27 +1290,28 @@ class InventoryManagerApp:
         inner_frame = ctk.CTkFrame(field_frame, fg_color="transparent")
         inner_frame.pack(fill="x", padx=20, pady=10)
         
-        # Configurar grid
-        inner_frame.grid_columnconfigure(0, weight=6)  # Label: 60%
-        inner_frame.grid_columnconfigure(1, weight=4)  # RadioButtons: 40%
+        # Configurar grid con columna fija para RadioButtons
+        inner_frame.grid_columnconfigure(0, weight=6)  # Label: flexible
+        inner_frame.grid_columnconfigure(1, weight=0, minsize=150)  # RadioButtons: fijo 150px
         
-        # Label (columna 0)
+        # ===== LABEL (COLUMNA 0) =====
         label = ctk.CTkLabel(
             inner_frame,
             text=label_text,
             font=("Segoe UI", 12, "bold"),
-            anchor="w",
+            anchor="w",  # Alineado a la izquierda
             text_color="#333333"
         )
-        label.grid(row=0, column=0, sticky="w", padx=(0, 15))
+        label.grid(row=0, column=0, sticky="w", padx=(0, 30))  # 30px espacio a la derecha
         
-        # Tooltip
+        # Tooltip si existe
         if tooltip_text:
             ToolTip(label, tooltip_text)
         
-        # Frame para RadioButtons (columna 1)
-        radio_frame = ctk.CTkFrame(inner_frame, fg_color="transparent")
-        radio_frame.grid(row=0, column=1, sticky="w")
+        # ===== FRAME PARA RADIOBUTTONS (COLUMNA 1) - ANCHO FIJO =====
+        radio_frame = ctk.CTkFrame(inner_frame, fg_color="transparent", width=150)
+        radio_frame.grid(row=0, column=1, sticky="e")  # Alineado a la derecha
+        radio_frame.grid_propagate(False)  # Mantener ancho fijo
         
         # Variable para almacenar selección
         var = tk.StringVar(value="")
@@ -1330,9 +1326,10 @@ class InventoryManagerApp:
             fg_color=COLOR_VERDE_HOSPITAL,
             hover_color="#1F5A32",
             border_width_checked=8,
-            border_width_unchecked=2
+            border_width_unchecked=2,
+            width=60  # Ancho fijo para consistencia
         )
-        radio_si.pack(side="left", padx=(0, 20))
+        radio_si.pack(side="left", padx=(0, 10))  # 10px entre Sí y No
         
         # RadioButton NO
         radio_no = ctk.CTkRadioButton(
@@ -1344,7 +1341,8 @@ class InventoryManagerApp:
             fg_color=COLOR_VERDE_HOSPITAL,
             hover_color="#1F5A32",
             border_width_checked=8,
-            border_width_unchecked=2
+            border_width_unchecked=2,
+            width=60  # Ancho fijo para consistencia
         )
         radio_no.pack(side="left")
         
@@ -2725,10 +2723,10 @@ Total: 56 columnas completas
         for field_data in fields:
             if len(field_data) == 4:
                 label, key, field_type, options = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, options)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, options)
             else:
                 label, key, field_type = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, None)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, None)
             self.imp_widgets[key] = widget
         
         # Frame para botones
@@ -3060,10 +3058,10 @@ Total: 56 columnas completas
         for field_data in fields:
             if len(field_data) == 4:
                 label, key, field_type, options = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, options)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, options)
             else:
                 label, key, field_type = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, None)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, None)
             self.per_widgets[key] = widget
         
         # Frame para botones
@@ -3371,10 +3369,10 @@ Total: 56 columnas completas
         for field_data in fields:
             if len(field_data) == 4:
                 label, key, field_type, options = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, options)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, options)
             else:
                 label, key, field_type = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, None)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, None)
             self.red_widgets[key] = widget
         
         # Frame para botones
@@ -3691,10 +3689,10 @@ Total: 56 columnas completas
         for field_data in fields:
             if len(field_data) == 4:
                 label, key, field_type, options = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, options)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, options)
             else:
                 label, key, field_type = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, None)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, None)
             self.mtt_widgets[key] = widget
         
         btn_save = ctk.CTkButton(
@@ -3795,10 +3793,10 @@ Total: 56 columnas completas
         for field_data in fields:
             if len(field_data) == 4:
                 label, key, field_type, options = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, options)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, options)
             else:
                 label, key, field_type = field_data
-                widget = self.create_form_field(scroll, label, key, field_type, None)
+                widget = self.create_form_field_centered(scroll, label, key, field_type, None)
             self.baja_widgets[key] = widget
         
         # Botón para buscar y autocompletar
