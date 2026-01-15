@@ -1046,6 +1046,76 @@ class InventoryManagerApp:
         except Exception as e:
             print(f"Error buscando siguiente fila: {e}")
             return 2
+        
+    # ============================================================================
+    # MÉTODO 1: get_next_consecutivo()
+    # ============================================================================
+
+    def get_next_consecutivo(self):
+        """
+        Obtener el siguiente número consecutivo para Equipos de Cómputo.
+        
+        Busca el último consecutivo en la columna 1 de "Equipos de Cómputo"
+        y retorna el siguiente número.
+        
+        Returns:
+            int: Siguiente consecutivo (ej: si el último es 5, retorna 6)
+        """
+        if not self.excel_path or not HAS_OPENPYXL:
+            return 1
+        
+        try:
+            wb = load_workbook(self.excel_path, read_only=True)
+            
+            # Verificar que la hoja existe
+            if "Equipos de Cómputo" not in wb.sheetnames:
+                wb.close()
+                return 1
+            
+            ws = wb["Equipos de Cómputo"]
+            
+            # Buscar el ÚLTIMO consecutivo en columna 1
+            last_consecutive = 0
+            for row in range(2, 500):
+                value = ws.cell(row=row, column=1).value
+                if value is not None:
+                    try:
+                        consecutivo = int(value)
+                        if consecutivo > last_consecutive:
+                            last_consecutive = consecutivo
+                    except:
+                        pass
+                else:
+                    break  # Primera fila vacía, detener
+            
+            wb.close()
+            
+            # Retornar siguiente consecutivo
+            return last_consecutive + 1
+            
+        except Exception as e:
+            print(f"❌ Error obteniendo consecutivo: {e}")
+            return 1
+
+
+    # ============================================================================
+    # MÉTODO 2: get_next_codigo()
+    # ============================================================================
+
+    def get_next_codigo(self):
+        """
+        Obtener el siguiente código para Equipos de Cómputo.
+        
+        Usa get_next_consecutivo() y retorna el código formateado.
+        
+        Returns:
+            str: Código formateado (ej: "EQC-0001", "EQC-0142")
+        """
+        try:
+            next_consecutive = self.get_next_consecutivo()
+            return f"EQC-{next_consecutive:04d}"
+        except:
+            return "EQC-0001"
     
     def create_header(self):
         """Crear encabezado con logo en círculo blanco."""
@@ -2365,7 +2435,8 @@ class InventoryManagerApp:
             messagebox.showerror("Error", f"Error al guardar en Excel:\n{e}")
     
     def save_equipo_manual_only(self):
-        """Guardar solo datos manuales (sin recopilación automática).        """
+        """Guardar solo datos manuales (sin recopilación automática)."""
+        
         # ===== VALIDACIÓN DE CAMPOS OBLIGATORIOS =====
         required_fields = {
             'tipo_equipo': 'Tipo de Equipo',
@@ -2424,7 +2495,7 @@ class InventoryManagerApp:
                     elif isinstance(widget, ctk.CTkComboBox):
                         datos_guardados[field_name] = widget.get()
                     
-                    # StringVar (RadioButtons) ← NUEVO
+                    # StringVar (RadioButtons)
                     elif isinstance(widget, tk.StringVar):
                         datos_guardados[field_name] = widget.get()
                     
@@ -2439,6 +2510,10 @@ class InventoryManagerApp:
         # ===== GUARDAR EN EXCEL =====
         try:
             # Abrir Excel
+            if not self.excel_path:
+                messagebox.showerror("Error", "No hay Excel cargado")
+                return
+            
             if not os.path.exists(self.excel_path):
                 messagebox.showerror("Error", f"No se encontró el archivo: {self.excel_path}")
                 return
@@ -2446,19 +2521,37 @@ class InventoryManagerApp:
             wb = openpyxl.load_workbook(self.excel_path)
             
             if "Equipos de Cómputo" not in wb.sheetnames:
-                messagebox.showerror("Error", f"No se encontró la hoja: {"Equipos de Cómputo"}")
+                messagebox.showerror("Error", "No se encontró la hoja: Equipos de Cómputo")
                 return
             
             ws = wb["Equipos de Cómputo"]
             
-            # Obtener siguiente consecutivo y código
-            next_consecutivo = self.get_next_consecutivo()
-            next_codigo = self.get_next_codigo()
+            # ===== BUSCAR ÚLTIMO CONSECUTIVO Y PRIMERA FILA VACÍA =====
+            # Buscar ÚLTIMA fila con datos (para consecutivo correcto)
+            last_consecutive = 0
+            for row in range(2, 500):
+                value = ws.cell(row=row, column=1).value
+                if value is not None:
+                    try:
+                        consecutivo = int(value)
+                        if consecutivo > last_consecutive:
+                            last_consecutive = consecutivo
+                    except:
+                        pass
             
-            # Nueva fila
-            nueva_fila = ws.max_row + 1
+            # Siguiente consecutivo
+            next_consecutivo = last_consecutive + 1
+            next_codigo = f"EQC-{next_consecutivo:04d}"
             
-            # ===== MAPEO A 85 COLUMNAS =====
+            # Buscar PRIMERA fila vacía (para insertar datos)
+            nueva_fila = 2  # Por defecto, fila 2
+            for row in range(2, 500):
+                # Verificar si la fila está completamente vacía
+                if ws.cell(row=row, column=1).value is None:
+                    nueva_fila = row
+                    break
+            
+            # ===== MAPEO A 80 COLUMNAS (VERSION ACTUAL) =====
             
             # Cols 1-2: Identificación
             ws.cell(row=nueva_fila, column=1).value = next_consecutivo  # N° Consecutivo
@@ -2467,19 +2560,18 @@ class InventoryManagerApp:
             # Col 3: Nombre Equipo (VERDE - se llenará después)
             ws.cell(row=nueva_fila, column=3).value = ''  # Vacío por ahora
             
-            # Cols 4-7: Básicos (NARANJA)
+            # Cols 4-10: Básicos (NARANJA)
             ws.cell(row=nueva_fila, column=4).value = datos_guardados.get('tipo_equipo', '')
             ws.cell(row=nueva_fila, column=5).value = datos_guardados.get('area_servicio', '')
             ws.cell(row=nueva_fila, column=6).value = datos_guardados.get('ubicacion_especifica', '')
             ws.cell(row=nueva_fila, column=7).value = datos_guardados.get('responsable_custodio', '')
-            
-            # Cols 8-10: Macroproceso/Proceso/Subproceso (NARANJA)
             ws.cell(row=nueva_fila, column=8).value = datos_guardados.get('macroproceso', '')
             ws.cell(row=nueva_fila, column=9).value = datos_guardados.get('proceso', '')
             ws.cell(row=nueva_fila, column=10).value = datos_guardados.get('subproceso', '')
             
             # Cols 11-16: Software (NARANJA)
             ws.cell(row=nueva_fila, column=11).value = datos_guardados.get('uso_sihos', '')
+            ws.cell(row=nueva_fila, column=12).value = datos_guardados.get('uso_sifax', '')
             ws.cell(row=nueva_fila, column=13).value = datos_guardados.get('uso_office_basico', '')
             ws.cell(row=nueva_fila, column=14).value = datos_guardados.get('software_especializado', '')
             ws.cell(row=nueva_fila, column=15).value = datos_guardados.get('descripcion_software', '')
@@ -2501,9 +2593,16 @@ class InventoryManagerApp:
             # Cols 35-46: Operativos (NARANJA)
             ws.cell(row=nueva_fila, column=35).value = datos_guardados.get('horario_uso', '')
             ws.cell(row=nueva_fila, column=36).value = datos_guardados.get('estado_operativo', '')
-            ws.cell(row=nueva_fila, column=37).value = datos_guardados.get('observaciones_tecnicas', '')
-            ws.cell(row=nueva_fila, column=38).value = datos_guardados.get('periodicidad_mtto', '')
-            ws.cell(row=nueva_fila, column=39).value = datos_guardados.get('responsable_mtto', '')
+            ws.cell(row=nueva_fila, column=37).value = datos_guardados.get('fecha_adquisicion', '')
+            ws.cell(row=nueva_fila, column=38).value = datos_guardados.get('valor_adquisicion', '')
+            ws.cell(row=nueva_fila, column=39).value = datos_guardados.get('fecha_venc_garantia', '')
+            ws.cell(row=nueva_fila, column=40).value = datos_guardados.get('observaciones_tecnicas', '')
+            ws.cell(row=nueva_fila, column=41).value = datos_guardados.get('fecha_exp_antivirus', '')
+            ws.cell(row=nueva_fila, column=42).value = datos_guardados.get('periodicidad_mtto', '')
+            ws.cell(row=nueva_fila, column=43).value = datos_guardados.get('responsable_mtto', '')
+            ws.cell(row=nueva_fila, column=44).value = datos_guardados.get('ultimo_mantenimiento', '')
+            ws.cell(row=nueva_fila, column=45).value = datos_guardados.get('tipo_ultimo_mtto', '')
+            ws.cell(row=nueva_fila, column=46).value = datos_guardados.get('reservada', '')
             
             # Cols 47-77: Hardware/Software (VERDE) - Vacíos por ahora
             for col in range(47, 78):
@@ -2512,6 +2611,9 @@ class InventoryManagerApp:
             # Cols 78-84: Mixtos (AZUL) - Vacíos por ahora
             for col in range(78, 85):
                 ws.cell(row=nueva_fila, column=col).value = ''
+            
+            # Col 85: Antigüedad - Vacío por ahora
+            ws.cell(row=nueva_fila, column=85).value = ''
             
             # Guardar
             wb.save(self.excel_path)
@@ -2536,6 +2638,19 @@ class InventoryManagerApp:
                             widget.set('')
                         elif isinstance(widget, tk.StringVar):
                             widget.set('')
+                except:
+                    pass
+            
+            # Actualizar título del formulario con siguiente código
+            next_consecutive_display = next_consecutivo + 1
+            next_code_display = f"EQC-{next_consecutive_display:04d}"
+            
+            # Actualizar título en el frame del formulario
+            if hasattr(self, 'form_title_label'):
+                try:
+                    self.form_title_label.configure(
+                        text=f"📝 DATOS MANUALES - Equipo #{next_consecutive_display} (Código: {next_code_display})"
+                    )
                 except:
                     pass
             
