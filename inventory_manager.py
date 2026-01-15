@@ -9,17 +9,20 @@ VERSIÓN: 1.0
 FECHA: Enero 2026
 """
 
-import customtkinter as ctk
+import tkinter as tk
 from tkinter import messagebox, filedialog
+from tkcalendar import DateEntry
+
+import customtkinter as ctk
 import platform
 import socket
 import subprocess
 import os
 import re
+import threading
+
 from datetime import datetime
 from pathlib import Path
-import threading
-import tkinter as tk
 
 # Configurar tema CustomTkinter
 ctk.set_appearance_mode("light")
@@ -73,8 +76,8 @@ except ImportError:
 # COLORES INSTITUCIONALES
 # ============================================================================
 
-COLOR_VERDE_HOSPITAL = "#A9FA7B"
-COLOR_AZUL_HOSPITAL = "#008ACC"
+COLOR_VERDE_HOSPITAL = "#3C8B0E"
+COLOR_AZUL_HOSPITAL = "#3C8B0E"
 COLOR_NARANJA = "#F4B183"
 COLOR_FONDO = "#F5F5F5"
 COLOR_ERROR = "#DC3545"
@@ -137,20 +140,14 @@ class ToolTip:
 def detect_hardware_wmi():
     """
     Detectar hardware usando WMI.
-    
-    CORRECCIÓN CRÍTICA: Las claves ahora coinciden EXACTAMENTE con lo que 
-    espera collect_automatic_data():
-    - disco1_capacidad (antes era solo 'capacidad')
-    - disco1_tipo, disco1_serial, disco1_marca, disco1_modelo
-    - disco2_capacidad, disco2_tipo, disco2_serial, disco2_marca, disco2_modelo
     """
     info = {
         'marca': 'No detectado',
         'modelo': 'No detectado',
         'serial': 'No detectado',
-        # DISCO 1 (Primario) - CLAVES CORREGIDAS ✅
-        'disco1_capacidad': 'No detectado',  # ← Antes: 'capacidad'
-        'disco1_tipo': 'No detectado',       # ← Antes: 'tipo'
+        # DISCO 1 (Primario)
+        'disco1_capacidad': 'No detectado',  
+        'disco1_tipo': 'No detectado',      
         'disco1_serial': 'No detectado',
         'disco1_marca': 'No detectado',
         'disco1_modelo': 'No detectado',
@@ -218,7 +215,7 @@ def detect_hardware_wmi():
         # ===== DISCOS FÍSICOS =====
         disks = list(c.Win32_DiskDrive())
         
-        # DISCO 1 (PRIMARIO) ✅
+        # DISCO 1 (PRIMARIO)
         if len(disks) > 0:
             disk1 = disks[0]
             
@@ -226,16 +223,16 @@ def detect_hardware_wmi():
             try:
                 size_bytes = int(disk1.Size) if disk1.Size else 0
                 size_gb = round(size_bytes / (1024**3))
-                info['disco1_capacidad'] = str(size_gb)  # ← CLAVE CORRECTA
+                info['disco1_capacidad'] = str(size_gb) 
             except:
                 info['disco1_capacidad'] = 'No detectado'
             
             # Tipo (SSD o HDD)
             media_type = disk1.MediaType or ''
             if 'SSD' in media_type.upper() or 'Solid State' in media_type:
-                info['disco1_tipo'] = 'SSD'  # ← CLAVE CORRECTA
+                info['disco1_tipo'] = 'SSD'
             else:
-                info['disco1_tipo'] = 'HDD'  # ← CLAVE CORRECTA
+                info['disco1_tipo'] = 'HDD'  
             
             # Serial
             serial_disk = (disk1.SerialNumber or '').strip()
@@ -252,7 +249,7 @@ def detect_hardware_wmi():
             modelo_disk = (disk1.Model or '').strip()
             info['disco1_modelo'] = modelo_disk if modelo_disk else 'No detectado'
         
-        # DISCO 2 (SECUNDARIO) ✅
+        # DISCO 2 (SECUNDARIO)
         if len(disks) > 1:
             disk2 = disks[1]
             
@@ -485,6 +482,117 @@ def detect_last_windows_update():
     
     except Exception as e:
         return "No detectado"
+    
+def detect_mac_address():
+    """Detectar dirección MAC de la interfaz de red principal."""
+    try:
+        import uuid
+        mac = ':'.join(['{:02x}'.format((uuid.getnode() >> elements) & 0xff)
+                       for elements in range(0,2*6,2)][::-1])
+        return mac.upper()
+    except:
+        return "No detectado"
+
+
+def detect_default_browser():
+    """Detectar navegador predeterminado en Windows."""
+    if not HAS_WINREG:
+        return "No detectado"
+    
+    try:
+        # Leer asociación de protocolo http
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice"
+        )
+        prog_id = winreg.QueryValueEx(key, "ProgId")[0]
+        winreg.CloseKey(key)
+        
+        # Mapear ProgId a nombre de navegador
+        browser_map = {
+            'ChromeHTML': 'Google Chrome',
+            'FirefoxURL': 'Mozilla Firefox',
+            'MSEdgeHTM': 'Microsoft Edge',
+            'IE.HTTP': 'Internet Explorer',
+            'BraveHTML': 'Brave',
+            'OperaStable': 'Opera'
+        }
+        
+        for key_name, browser_name in browser_map.items():
+            if key_name in prog_id:
+                return browser_name
+        
+        return "Otro navegador"
+    
+    except Exception as e:
+        # Fallback: buscar ejecutables comunes
+        browsers = [
+            (r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", "Google Chrome"),
+            (r"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe", "Google Chrome"),
+            (r"C:\\Program Files\\Mozilla Firefox\\firefox.exe", "Mozilla Firefox"),
+            (r"C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe", "Mozilla Firefox"),
+            (r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", "Microsoft Edge"),
+        ]
+        
+        for path, name in browsers:
+            if os.path.exists(path):
+                return f"{name} (detectado)"
+        
+        return "No detectado"
+
+
+def detect_network_drives():
+    """Detectar unidades de red mapeadas (ej: Z:\\, Y:\\)."""
+    try:
+        import subprocess
+        
+        # Ejecutar comando "net use" para listar unidades de red
+        result = subprocess.run(
+            ['net', 'use'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        output = result.stdout
+        drives = []
+        
+        # Parsear salida de "net use"
+        for line in output.split('\\n'):
+            # Buscar líneas con unidades (formato: OK   Z:   \\\\servidor\\carpeta)
+            if ':' in line and '\\\\\\\\' in line:
+                parts = line.split()
+                for part in parts:
+                    if ':' in part and len(part) == 2:
+                        drives.append(part)
+        
+        if drives:
+            return ', '.join(sorted(set(drives)))
+        else:
+            return "Ninguna"
+    
+    except Exception as e:
+        return "No detectado"
+
+
+def detect_ip_local():
+    """Detectar IP local del equipo."""
+    try:
+        # Método 1: Conectar a servidor externo (más confiable)
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except:
+        try:
+            # Método 2: Usar hostname
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+            return local_ip
+        except:
+            return "No detectado"
 
 
 # ============================================================================
@@ -539,7 +647,7 @@ class InventoryManagerApp:
     
     
     def create_native_menu(self):
-        """Crear menú nativo de tkinter (por encima del header)."""
+        """Crear menú nativo de tkinter."""
         
         # Crear barra de menú nativa
         menubar = tk.Menu(self.root)
@@ -636,26 +744,26 @@ class InventoryManagerApp:
         # Obtener código siguiente
         try:
             next_code = self.get_next_codigo()
-            codigo_text = f"Código: {next_code}"
+            codigo_text = f"Equipo: {next_code}"
         except:
-            codigo_text = "Código: EQC-0001"
+            codigo_text = "Equipo: EQC-0001"
         
         title_label = ctk.CTkLabel(
             title_frame,
-            text=f"📝 DATOS MANUALES - Equipo #1 ({codigo_text})",
+            text=f"{codigo_text}",
             font=("Segoe UI", 16, "bold"),
             text_color="white"
         )
         title_label.pack(pady=15)
         
         # ===== CAMPOS BÁSICOS =====
-        self.create_form_field_centered(form_frame, "* Tipo de Equipo", "tipo_equipo", 
+        self.create_form_field_centered(form_frame, "Tipo de Equipo", "tipo_equipo", 
                                         "combobox", TIPOS_EQUIPO)
-        self.create_form_field_centered(form_frame, "* Área / Servicio", "area_servicio", 
+        self.create_form_field_centered(form_frame, "Área / Servicio", "area_servicio", 
                                         "combobox", AREAS_SERVICIO)
-        self.create_form_field_centered(form_frame, "* Ubicación Específica", "ubicacion_especifica", 
+        self.create_form_field_centered(form_frame, "Ubicación Específica", "ubicacion_especifica", 
                                         "entry")
-        self.create_form_field_centered(form_frame, "* Responsable / Custodio", "responsable_custodio", 
+        self.create_form_field_centered(form_frame, "Responsable / Custodio", "responsable_custodio", 
                                         "entry")
         
         # ===== SECCIÓN: CLASIFICACIÓN POR PROCESOS =====
@@ -670,11 +778,11 @@ class InventoryManagerApp:
         )
         label_procesos.pack(pady=(10, 15))
         
-        self.create_form_field_centered(form_frame, "* Macroproceso", "macroproceso", 
+        self.create_form_field_centered(form_frame, "Macroproceso", "macroproceso", 
                                         "combobox", list(MACROPROCESOS.keys()))
-        self.create_form_field_centered(form_frame, "* Proceso", "proceso", 
+        self.create_form_field_centered(form_frame, "Proceso", "proceso", 
                                         "combobox", ["Selecciona primero Macroproceso"])
-        self.create_form_field_centered(form_frame, "* Subproceso", "subproceso", 
+        self.create_form_field_centered(form_frame, "Subproceso", "subproceso", 
                                         "combobox", ["Selecciona primero Proceso"])
         
         # Configurar eventos condicionales
@@ -697,9 +805,7 @@ class InventoryManagerApp:
         )
         label_software.pack(pady=(10, 15))
         
-        self.create_form_field_centered(form_frame, "* Uso - SIHOS", "uso_sihos", 
-                                        "combobox", SI_NO)
-        self.create_form_field_centered(form_frame, "Uso - SIFAX", "uso_sifax", 
+        self.create_form_field_centered(form_frame, "Uso - SIHOS", "uso_sihos", 
                                         "combobox", SI_NO)
         self.create_form_field_centered(form_frame, "Uso - Office Básico", "uso_office_basico", 
                                         "combobox", SI_NO)
@@ -708,6 +814,29 @@ class InventoryManagerApp:
         self.create_form_field_centered(form_frame, "Descripción Software", "descripcion_software", 
                                         "entry")
         self.create_form_field_centered(form_frame, "Función Principal", "funcion_principal", 
+                                        "entry")
+        
+        # ===== SECCIÓN: INFORMACIÓN OPERATIVA =====
+        separator4 = ctk.CTkFrame(form_frame, height=2, fg_color="#CCCCCC")
+        separator4.pack(fill="x", padx=20, pady=15)
+        
+        label_operativo = ctk.CTkLabel(
+            form_frame,
+            text="⚙️ INFORMACIÓN OPERATIVA",
+            font=("Segoe UI", 14, "bold"),
+            text_color=COLOR_AZUL_HOSPITAL
+        )
+        label_operativo.pack(pady=(10, 15))
+        
+        self.create_form_field_centered(form_frame, "Horario de Uso", "horario_uso", 
+                                        "combobox", HORARIOS_USO)
+        self.create_form_field_centered(form_frame, "Estado Operativo", "estado_operativo", 
+                                        "combobox", ESTADOS_OPERATIVOS)
+        self.create_form_field_centered(form_frame, "Periodicidad Mantenimiento", "periodicidad_mtto", 
+                                        "combobox", PERIODICIDADES_MTTO)
+        self.create_form_field_centered(form_frame, "Responsable Mantenimiento", "responsable_mtto", 
+                                        "combobox", TECNICOS_RESPONSABLES)
+        self.create_form_field_centered(form_frame, "Observaciones Técnicas", "observaciones_tecnicas", 
                                         "entry")
         
         # ===== SECCIÓN: CUESTIONARIO CON RADIOBUTTONS =====
@@ -775,42 +904,6 @@ class InventoryManagerApp:
             field_name = f"crit_{i}"
             self.create_radio_field_centered(form_frame, label_text, field_name, tooltip_text)
         
-        # ===== SECCIÓN: INFORMACIÓN OPERATIVA =====
-        separator4 = ctk.CTkFrame(form_frame, height=2, fg_color="#CCCCCC")
-        separator4.pack(fill="x", padx=20, pady=15)
-        
-        label_operativo = ctk.CTkLabel(
-            form_frame,
-            text="⚙️ INFORMACIÓN OPERATIVA",
-            font=("Segoe UI", 14, "bold"),
-            text_color=COLOR_AZUL_HOSPITAL
-        )
-        label_operativo.pack(pady=(10, 15))
-        
-        self.create_form_field_centered(form_frame, "Horario de Uso", "horario_uso", 
-                                        "combobox", HORARIOS_USO)
-        self.create_form_field_centered(form_frame, "* Estado Operativo", "estado_operativo", 
-                                        "combobox", ESTADOS_OPERATIVOS)
-        self.create_form_field_centered(form_frame, "Fecha Adquisición (YYYY-MM-DD)", 
-                                        "fecha_adquisicion", "entry")
-        self.create_form_field_centered(form_frame, "Valor Adquisición", "valor_adquisicion", 
-                                        "entry")
-        self.create_form_field_centered(form_frame, "Fecha Venc. Garantía (YYYY-MM-DD)", 
-                                        "fecha_venc_garantia", "entry")
-        self.create_form_field_centered(form_frame, "Observaciones Técnicas", "observaciones_tecnicas", 
-                                        "entry")
-        self.create_form_field_centered(form_frame, "Fecha Exp. Antivirus (YYYY-MM-DD)", 
-                                        "fecha_exp_antivirus", "entry")
-        self.create_form_field_centered(form_frame, "Periodicidad Mantenimiento", "periodicidad_mtto", 
-                                        "combobox", PERIODICIDADES_MTTO)
-        self.create_form_field_centered(form_frame, "Responsable Mantenimiento", "responsable_mtto", 
-                                        "entry")
-        self.create_form_field_centered(form_frame, "Último Mantenimiento (YYYY-MM-DD)", 
-                                        "ultimo_mantenimiento", "entry")
-        self.create_form_field_centered(form_frame, "Tipo Último Mantenimiento", "tipo_ultimo_mtto", 
-                                        "combobox", TIPOS_MANTENIMIENTO_MTTO)
-        self.create_form_field_centered(form_frame, "Reservada", "reservada", "entry")
-        
         # ===== BOTONES (3 HORIZONTALES IGUALES) =====
         separator5 = ctk.CTkFrame(form_frame, height=2, fg_color="#CCCCCC")
         separator5.pack(fill="x", padx=20, pady=15)
@@ -840,8 +933,8 @@ class InventoryManagerApp:
             text="🔄 ACTUALIZAR",
             command=self.update_equipo_computo,
             font=("Segoe UI", 13, "bold"),
-            fg_color="#2196F3",
-            hover_color="#1976D2",
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
             height=BTN_HEIGHT,
             width=BTN_WIDTH
         )
@@ -853,8 +946,8 @@ class InventoryManagerApp:
             text="➡️ RECOPILACIÓN AUTO",
             command=self.start_automatic_collection,
             font=("Segoe UI", 13, "bold"),
-            fg_color="#FF9800",
-            hover_color="#F57C00",
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
             height=BTN_HEIGHT,
             width=BTN_WIDTH
         )
@@ -955,7 +1048,7 @@ class InventoryManagerApp:
             return 2
     
     def create_header(self):
-        """Crear encabezado con logo en círculo blanco.        """
+        """Crear encabezado con logo en círculo blanco."""
         header_frame = ctk.CTkFrame(self.root, fg_color=COLOR_VERDE_HOSPITAL, corner_radius=0)
         header_frame.pack(fill="x", padx=0, pady=0)
         
@@ -976,7 +1069,7 @@ class InventoryManagerApp:
                     try:
                         from PIL import Image, ImageDraw
                         
-                        # 1. Cargar logo original (SIN MODIFICARLO)
+                        # 1. Cargar logo original
                         logo_original = Image.open(logo_path)
                         
                         # 2. Convertir a RGBA si no lo es
@@ -998,11 +1091,11 @@ class InventoryManagerApp:
                         draw.ellipse([0, 0, circle_size-1, circle_size-1], 
                                     fill=(255, 255, 255, 255))
                         
-                        # 5. Centrar logo sobre círculo blanco (SIN MODIFICAR PÍXELES DEL LOGO)
+                        # 5. Centrar logo sobre círculo blanco
                         x_offset = (circle_size - new_width) // 2
                         y_offset = (circle_size - new_height) // 2
                         
-                        # Pegar logo directamente (respetando su transparencia original)
+                        # Pegar logo
                         background.paste(logo_resized, (x_offset, y_offset), logo_resized)
                         
                         # 6. Convertir a CTkImage
@@ -1047,7 +1140,7 @@ class InventoryManagerApp:
         # Status label
         self.status_label = ctk.CTkLabel(
             header_frame,
-            text="HOLA",
+            text="",
             font=("Segoe UI", 10),
             text_color="white",
             fg_color="transparent"
@@ -1066,6 +1159,7 @@ class InventoryManagerApp:
             
             # Detectar siguiente fila
             self.current_row = self.get_next_available_row("Equipos de Cómputo", check_column=1)
+            self.current_row = self.current_row-1
             
             # Actualizar status
             filename_short = os.path.basename(filename)
@@ -1085,6 +1179,7 @@ class InventoryManagerApp:
             
             # Detectar siguiente fila automáticamente
             self.current_row = self.get_next_available_row("Equipos de Cómputo", check_column=1)
+            self.current_row = self.current_row-1
             
             # Actualizar status
             self.status_label.configure(text=f"✅ {default_file} cargado")
@@ -1180,7 +1275,7 @@ class InventoryManagerApp:
             
             next_consecutive = last_consecutive + 1
             
-            # Todos los códigos ahora son de 4 dígitos
+            # Todos los códigos son de 4 dígitos
             return f"{prefix}-{next_consecutive:04d}"
             
         except Exception as e:
@@ -1188,6 +1283,54 @@ class InventoryManagerApp:
             import traceback
             traceback.print_exc()
             return f"{prefix}-001"
+        
+    def get_next_codigo(self):
+        """
+        Obtener siguiente código EQC para equipos de cómputo.
+        Wrapper de detect_next_code() para compatibilidad.
+        """
+        return self.detect_next_code("Equipos de Cómputo", "EQC")
+    
+    def get_next_consecutivo(self):
+        """
+        Obtener siguiente número consecutivo para equipos de cómputo.
+        Busca el último consecutivo en la columna 1 de "Equipos de Cómputo".
+        """
+        if not self.excel_path or not HAS_OPENPYXL:
+            return 1
+        
+        try:
+            wb = load_workbook(self.excel_path, read_only=True)
+            
+            # Verificar que la hoja existe
+            if "Equipos de Cómputo" not in wb.sheetnames:
+                wb.close()
+                return 1
+            
+            ws = wb["Equipos de Cómputo"]
+            
+            # Buscar el ÚLTIMO consecutivo en columna 1
+            last_consecutive = 0
+            for row in range(2, 500):
+                value = ws.cell(row=row, column=1).value
+                if value is not None:
+                    try:
+                        consecutivo = int(value)
+                        if consecutivo > last_consecutive:
+                            last_consecutive = consecutivo
+                    except:
+                        pass
+                else:
+                    break  # Primera fila vacía, detener
+            
+            wb.close()
+            
+            # Siguiente consecutivo
+            return last_consecutive + 1
+            
+        except Exception as e:
+            print(f"❌ Error obteniendo consecutivo: {e}")
+            return 1
     
     def detect_next_consecutive_mantenimiento(self):
         """Detectar siguiente consecutivo para mantenimientos."""
@@ -1246,13 +1389,13 @@ class InventoryManagerApp:
         if tooltip_text:
             ToolTip(label, tooltip_text)
         
-        # ===== WIDGET (COLUMNA 1) - ANCHO FIJO =====
+        # ===== WIDGET (COLUMNA 1) =====
         if field_type == "combobox":
             widget = ctk.CTkComboBox(
                 inner_frame,
                 values=options if options else [],
                 height=35,
-                width=300,  # ← ANCHO FIJO 300px
+                width=300, 
                 font=("Segoe UI", 11),
                 dropdown_font=("Segoe UI", 10),
                 border_color="#CCCCCC",
@@ -1266,7 +1409,7 @@ class InventoryManagerApp:
             widget = ctk.CTkEntry(
                 inner_frame,
                 height=35,
-                width=300,  # ← ANCHO FIJO 300px
+                width=300,
                 font=("Segoe UI", 11),
                 border_color="#CCCCCC",
                 fg_color="white",
@@ -1277,6 +1420,78 @@ class InventoryManagerApp:
         # Guardar widget
         self.manual_widgets[field_name] = widget
         return widget
+    
+    def create_date_field_centered(self, parent, label_text, field_name, tooltip_text=None):
+        """
+        Crear campo de FECHA con calendario (DateEntry).
+        Similar a create_form_field_centered pero con calendario.
+        """
+        # Frame principal - CENTRADO con padding lateral
+        field_frame = ctk.CTkFrame(parent, fg_color="white", corner_radius=8)
+        field_frame.pack(fill="x", padx=40, pady=6)
+        
+        # Frame interno - Grid layout
+        inner_frame = ctk.CTkFrame(field_frame, fg_color="transparent")
+        inner_frame.pack(fill="x", padx=20, pady=10)
+        
+        # Configurar grid (2 columnas)
+        inner_frame.grid_columnconfigure(0, weight=6)  # Label: flexible
+        inner_frame.grid_columnconfigure(1, weight=0, minsize=300)  # Widget: fijo 300px
+        
+        # ===== LABEL (COLUMNA 0) =====
+        label = ctk.CTkLabel(
+            inner_frame,
+            text=label_text,
+            font=("Segoe UI", 12, "bold"),
+            anchor="w",
+            text_color="#333333"
+        )
+        label.grid(row=0, column=0, sticky="w", padx=(0, 30))
+        
+        # Tooltip si existe
+        if tooltip_text:
+            ToolTip(label, tooltip_text)
+        
+        # ===== WIDGET FECHA (COLUMNA 1) =====
+        # Usar DateEntry (calendario visual)
+        widget = DateEntry(
+            inner_frame,
+            width=28,
+            background=COLOR_VERDE_HOSPITAL,
+            foreground='white',
+            borderwidth=2,
+            font=("Segoe UI", 11),
+            date_pattern='yyyy-mm-dd',  # Formato ISO
+            showweeknumbers=False,
+            showothermonthdays=False,
+            selectbackground=COLOR_VERDE_HOSPITAL,
+            selectforeground='white',
+            normalbackground='white',
+            normalforeground='black',
+            weekendbackground='#F0F0F0',
+            weekendforeground='black',
+            othermonthbackground='white',
+            othermonthweforeground='gray',
+            othermonthwebackground='#F0F0F0'
+        )
+        widget.grid(row=0, column=1, sticky="e")
+        
+        # Guardar widget
+        self.manual_widgets[field_name] = widget
+        return widget
+    
+    def get_date_value(self, widget):
+        """
+        Obtener valor de fecha de un widget (DateEntry o Entry).
+        
+        Returns:
+            str: Fecha en formato YYYY-MM-DD o cadena vacía
+        """
+        try:
+            date_obj = widget.get_date()
+            return date_obj.strftime('%Y-%m-%d')
+        except:
+            return ''
     
     def create_radio_field_centered(self, parent, label_text, field_name, tooltip_text=None):
         """
@@ -1308,7 +1523,7 @@ class InventoryManagerApp:
         if tooltip_text:
             ToolTip(label, tooltip_text)
         
-        # ===== FRAME PARA RADIOBUTTONS (COLUMNA 1) - ANCHO FIJO =====
+        # ===== FRAME PARA RADIOBUTTONS (COLUMNA 1) =====
         radio_frame = ctk.CTkFrame(inner_frame, fg_color="transparent", width=150)
         radio_frame.grid(row=0, column=1, sticky="e")  # Alineado a la derecha
         radio_frame.grid_propagate(False)  # Mantener ancho fijo
@@ -1425,8 +1640,8 @@ class InventoryManagerApp:
     1️⃣ DATOS MANUALES
     • Información básica del equipo
     • Área, ubicación, responsable
-    • Software utilizado (SIHOS, SIFAX, Office)
-    • Información operativa (horarios, estado, garantía)
+    • Software utilizado (SIFAX, Office, Especializado)
+    • Información operativa (horarios, estado)
     • Macroproceso → Proceso → Subproceso (condicional)
     • Cuestionario de clasificación (18 preguntas)
     
@@ -1456,12 +1671,10 @@ class InventoryManagerApp:
 
     4️⃣ GUARDADO FINAL
     • Se guardan TODAS las columnas en Excel
-    • Total: 85 columnas de información
     • Archivo: inventario_hospital_v1.xlsx
 
     🎯 RECOMENDACIONES
 
-    ✓ Completa campos obligatorios (marcados con *)
     ✓ Usa GUARDAR si no necesitas detección automática
     ✓ Usa RECOPILACIÓN AUTO para inventario completo
     ✓ Puedes ACTUALIZAR equipos en cualquier momento
@@ -1567,14 +1780,7 @@ class InventoryManagerApp:
 
     📅 FECHAS (Formato: YYYY-MM-DD)
     Ejemplo: 2024-01-15
-    • Fecha de Adquisición: Cuando se compró/recibió
-    • Fecha Venc. Garantía: Cuando vence la garantía
-    • Fecha Exp. Antivirus: Cuando vence la licencia
     • Último Mantenimiento: Fecha del último mtto
-
-    💰 VALOR DE ADQUISICIÓN
-    • Solo números (sin puntos, comas ni símbolos)
-    • Ejemplo: 2500000 (dos millones quinientos mil pesos)
 
     📋 CAMPOS OBLIGATORIOS (*)
     • Tipo de Equipo, Área, Ubicación
@@ -1721,7 +1927,7 @@ class InventoryManagerApp:
             self.root.update()
     
     def collect_automatic_data(self):
-        """Recopilar datos automáticos (VERDES) con detección WMI real."""
+        """Recopilar datos automáticos."""
         self.verde_data = {}
         
         # 1. Nombre del equipo
@@ -1729,7 +1935,7 @@ class InventoryManagerApp:
         self.verde_data['nombre_equipo'] = socket.gethostname()
         self.log_progress(f"   ✓ Nombre: {self.verde_data['nombre_equipo']}")
         
-        # 2. Hardware con WMI (ACTUALIZADO)
+        # 2. Hardware con WMI
         self.log_progress("\n💻 Detectando hardware con WMI...")
         hw_info = detect_hardware_wmi()
         
@@ -1742,7 +1948,7 @@ class InventoryManagerApp:
         self.log_progress(f"   ✓ Modelo: {self.verde_data['modelo']}")
         self.log_progress(f"   ✓ Serial: {self.verde_data['serial']}")
         
-        # ===== DISCO 1 (PRIMARIO) - DETECCIÓN COMPLETA =====
+        # ===== DISCO 1 (PRIMARIO) =====
         self.log_progress(f"\n💿 Disco 1 (Primario):")
         self.verde_data['disco1_capacidad'] = hw_info['disco1_capacidad']
         self.verde_data['disco1_tipo'] = hw_info['disco1_tipo']
@@ -1756,7 +1962,7 @@ class InventoryManagerApp:
         self.log_progress(f"   ✓ Marca: {hw_info['disco1_marca']}")
         self.log_progress(f"   ✓ Modelo: {hw_info['disco1_modelo']}")
         
-        # ===== DISCO 2 (SECUNDARIO) - DETECCIÓN COMPLETA =====
+        # ===== DISCO 2 (SECUNDARIO) =====
         if hw_info['disco2_capacidad'] != 'No tiene':
             self.log_progress(f"\n💿 Disco 2 (Secundario) Detectado:")
             self.log_progress(f"   ✓ Capacidad: {hw_info['disco2_capacidad']} GB")
@@ -1766,13 +1972,6 @@ class InventoryManagerApp:
             self.log_progress(f"   ✓ Modelo: {hw_info['disco2_modelo']}")
         else:
             self.log_progress(f"\n💿 Disco 2 (Secundario): No detectado")
-        
-        # Guardar disco 2 para validación mixta
-        self.verde_data['disco2_capacidad'] = hw_info['disco2_capacidad']
-        self.verde_data['disco2_tipo'] = hw_info['disco2_tipo']
-        self.verde_data['disco2_serial'] = hw_info['disco2_serial']
-        self.verde_data['disco2_marca'] = hw_info['disco2_marca']
-        self.verde_data['disco2_modelo'] = hw_info['disco2_modelo']
         
         # 5-7. Sistema Operativo
         self.log_progress("\n🪟 Sistema Operativo...")
@@ -1786,12 +1985,42 @@ class InventoryManagerApp:
         
         # 8-9. RAM y Almacenamiento
         if HAS_PSUTIL:
-            ram_gb = round(psutil.virtual_memory().total / (1024**3))
-            self.verde_data['ram_gb'] = str(ram_gb)
-            self.log_progress(f"   ✓ RAM: {ram_gb} GB")
+            # Obtener RAM utilizable
+            ram_bytes = psutil.virtual_memory().total
+            ram_gib_usable = ram_bytes / (1024**3)  # GiB utilizables
             
+            # Tamaños comerciales estándar
+            common_sizes = [2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128]
+            
+            # Redondeo inteligente con margen del 15%
+            # Busca el tamaño comercial más probable
+            # considerando que puede haber RAM reservada
+            best_match = None
+            min_diff = float('inf')
+            
+            for size in common_sizes:
+                # Considerar margen de -20% (por GPU integrada, BIOS, etc)
+                expected_usable = size * 0.80  # 80% del tamaño comercial
+                diff = abs(ram_gib_usable - expected_usable)
+                
+                # También considerar coincidencia directa
+                direct_diff = abs(ram_gib_usable - size)
+                
+                # Usar la mejor coincidencia
+                actual_diff = min(diff, direct_diff)
+                
+                if actual_diff < min_diff:
+                    min_diff = actual_diff
+                    best_match = size
+            
+            ram_gb = best_match
+            
+            self.verde_data['ram_gb'] = str(ram_gb)
+            self.log_progress(f"   ✓ RAM: {ram_gb} GB (utilizable: {ram_gib_usable:.2f} GiB)")
+            
+            # Almacenamiento
             try:
-                disk = psutil.disk_usage('C:\\')
+                disk = psutil.disk_usage('C:\\\\')
                 storage_gb = round(disk.total / (1024**3))
                 self.verde_data['almacenamiento_gb'] = str(storage_gb)
                 self.log_progress(f"   ✓ Almacenamiento: {storage_gb} GB")
@@ -1830,21 +2059,32 @@ class InventoryManagerApp:
         self.log_progress(f"   ✓ Key (últimos 5): {lic_info['key']}")
         self.log_progress(f"   ✓ Estado: {lic_info['estado']}")
         
-        # 19-20. Red
-        self.log_progress("\n🌐 Red...")
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            self.verde_data['direccion_ip'] = s.getsockname()[0]
-            s.close()
-            self.log_progress(f"   ✓ IP: {self.verde_data['direccion_ip']}")
-        except:
-            self.verde_data['direccion_ip'] = "No detectado"
-            self.log_progress(f"   ⚠️  IP no detectada")
+        # 19-23. Red
+        self.log_progress("\\n🌐 Red...")
+
+        # IP Local
+        ip_local = detect_ip_local()
+        self.verde_data['direccion_ip'] = ip_local
+        self.log_progress(f"   ✓ IP Local: {ip_local}")
+
+        # MAC Address
+        mac_address = detect_mac_address()
+        self.verde_data['mac_address'] = mac_address
+        self.log_progress(f"   ✓ MAC Address: {mac_address}")
+
+        self.verde_data['tipo_conexion'] = "Ethernet"  # Default
+
+        # Navegador predeterminado
+        navegador = detect_default_browser()
+        self.verde_data['navegador_predeterminado'] = navegador
+        self.log_progress(f"   ✓ Navegador: {navegador}")
+
+        # Unidades de red mapeadas (nuevo)
+        unidades_red = detect_network_drives()
+        self.verde_data['unidades_red_mapeadas'] = unidades_red
+        self.log_progress(f"   ✓ Unidades de red: {unidades_red}")
         
-        self.verde_data['tipo_conexion'] = "Ethernet"  # Default, se puede mejorar
-        
-        # 21-23. Seguridad
+        # 24-26. Seguridad
         self.log_progress("\n🔒 Seguridad...")
         self.verde_data['antivirus_instalado'] = "Windows Defender"
         self.verde_data['windows_update_activo'] = "Sí"
@@ -1865,7 +2105,7 @@ class InventoryManagerApp:
         self.root.after(1500, self.show_mixed_validation)
     
     def show_mixed_validation(self):
-        """Mostrar ventana de validación de campos mixtos (AZULES) - MEJORADO."""
+        """Mostrar ventana de validación de campos mixtos (AZULES)."""
         validation_window = ctk.CTkToplevel(self.root)
         validation_window.title("Validación de Campos Mixtos")
         validation_window.geometry("900x600")
@@ -1888,7 +2128,7 @@ class InventoryManagerApp:
         
         info = ctk.CTkLabel(
             validation_window,
-            text="Valida o corrige los siguientes campos detectados automáticamente:",
+            text="Valida o corrige los siguientes campos:",
             font=("Arial", 13)
         )
         info.pack(pady=(0, 20))
@@ -1897,26 +2137,17 @@ class InventoryManagerApp:
         scroll_frame = ctk.CTkScrollableFrame(validation_window, width=850, height=380)
         scroll_frame.pack(pady=10, padx=25)
         
-        # Campos mixtos
+        # Campos mixtos (SIN DISCO 2)
         self.mixed_widgets = {}
         
         mixed_fields = [
-            # Disco secundario (si fue detectado)
-            ("Almacenamiento Secundario (GB)", "disco_secundario", "entry", 
-             self.disco_secundario_info.get('disco_secundario', 'No tiene') if hasattr(self, 'disco_secundario_info') else 'No tiene'),
-            ("Tipo Disco Secundario", "tipo_disco_secundario", "combobox", 
-             ['No tiene', 'HDD', 'SSD'] if hasattr(self, 'disco_secundario_info') and self.disco_secundario_info.get('disco_secundario') != 'No tiene' else ['No tiene']),
-            ("Serial Disco Secundario", "serial_disco_secundario", "entry",
-             self.disco_secundario_info.get('serial_disco_secundario', 'No tiene') if hasattr(self, 'disco_secundario_info') else 'No tiene'),
-            ("Marca Disco Secundario", "marca_disco_secundario", "entry",
-             self.disco_secundario_info.get('marca_disco_secundario', 'No tiene') if hasattr(self, 'disco_secundario_info') else 'No tiene'),
-            ("Modelo Disco Secundario", "modelo_disco_secundario", "entry",
-             self.disco_secundario_info.get('modelo_disco_secundario', 'No tiene') if hasattr(self, 'disco_secundario_info') else 'No tiene'),
-            # Otros campos
+            # RED Y ACCESO REMOTO
             ("Switch / Puerto", "switch_puerto", "entry", "No detectado"),
             ("VLAN Asignada", "vlan_asignada", "entry", "No detectado"),
             ("ID AnyDesk", "id_anydesk", "entry", self.detect_anydesk()),
             ("Otro Acceso Remoto", "otro_acceso_remoto", "entry", "Ninguno"),
+            
+            # SEGURIDAD
             ("Estado Antivirus", "estado_antivirus", "combobox", OPCIONES_ESTADO_ANTIVIRUS),
             ("Cifrado de Disco", "cifrado_disco", "combobox", OPCIONES_CIFRADO_DISCO),
             ("Tipo Usuario Local", "tipo_usuario_local", "combobox", OPCIONES_TIPO_USUARIO),
@@ -1935,9 +2166,7 @@ class InventoryManagerApp:
             )
             label.pack(side="left", padx=(0, 15))
             
-            # CORRECCIÓN: Crear ComboBox correctamente cuando field_type == "combobox"
             if field_type == "combobox":
-                # default es una lista de opciones
                 widget = ctk.CTkComboBox(
                     field_frame,
                     values=default if isinstance(default, list) else ["No detectado"],
@@ -1946,11 +2175,9 @@ class InventoryManagerApp:
                     dropdown_font=("Arial", 11),
                     height=32
                 )
-                # Seleccionar primera opción por defecto
                 if isinstance(default, list) and len(default) > 0:
                     widget.set(default[0])
             else:
-                # Entry normal
                 widget = ctk.CTkEntry(
                     field_frame,
                     width=500,
@@ -2033,11 +2260,10 @@ class InventoryManagerApp:
             # ===== COLUMNAS 4-50: NARANJAS (DATOS MANUALES) =====
             col = 4
             
-            # Campos básicos (8)
+            # Campos básicos (7)
             basic_fields = [
                 'tipo_equipo', 'area_servicio', 'ubicacion_especifica', 'responsable_custodio',
-                'macroproceso', 'proceso', 'subproceso',  # ← NUEVOS CAMPOS JERÁRQUICOS
-                'uso_sihos'
+                'macroproceso', 'proceso', 'subproceso'
             ]
             
             for field in basic_fields:
@@ -2045,16 +2271,13 @@ class InventoryManagerApp:
                 ws.cell(row=row, column=col, value=value)
                 col += 1
             
-            # Campos software (4)
-            software_fields = ['uso_sifax', 'uso_office_basico', 'software_especializado', 'descripcion_software']
+            # Campos software (5)
+            software_fields = ['uso_sihos', 'uso_office_basico', 'software_especializado', 
+                            'descripcion_software', 'funcion_principal']
             for field in software_fields:
                 value = self.equipment_data.get(field, '')
                 ws.cell(row=row, column=col, value=value)
                 col += 1
-            
-            # Función principal (1)
-            ws.cell(row=row, column=col, value=self.equipment_data.get('funcion_principal', ''))
-            col += 1
             
             # ===== CUESTIONARIO DE CLASIFICACIÓN (18 PREGUNTAS) =====
             # 9 Confidencialidad
@@ -2075,33 +2298,38 @@ class InventoryManagerApp:
                 ws.cell(row=row, column=col, value=value)
                 col += 1
             
-            # Campos finales (9)
+            # Campos finales (4) - SIN FECHAS NI VALORES
             final_fields = [
-                'horario_uso', 'estado_operativo', 'fecha_adquisicion', 'valor_adquisicion',
-                'fecha_venc_garantia', 'observaciones_tecnicas', 'fecha_exp_antivirus',
-                'periodicidad_mtto', 'responsable_mtto', 'ultimo_mantenimiento', 'tipo_ultimo_mtto'
+                'horario_uso', 'estado_operativo', 'observaciones_tecnicas',
+                'periodicidad_mtto', 'responsable_mtto'
             ]
             for field in final_fields:
                 value = self.equipment_data.get(field, '')
                 ws.cell(row=row, column=col, value=value)
                 col += 1
             
-            # TOTAL NARANJAS: 8 + 4 + 1 + 18 + 11 = 42 columnas
+            # TOTAL NARANJAS: 7 + 5 + 1 + 18 + 4 = 35 columnas
+            # Básicos (7) + Software (5) + Función (1) + Cuestionario (18) + Operativos (4)
             
             # ===== COLUMNAS VERDES (HARDWARE Y SOFTWARE) =====
             verde_fields = [
-                'marca', 'modelo', 'serial', 'sistema_operativo', 'arquitectura_so',
-                'procesador', 'ram_gb',
-                # DISCO 1 (5 campos)
-                'disco1_capacidad', 'disco1_tipo', 'disco1_serial', 'disco1_marca', 'disco1_modelo',
-                # DISCO 2 (5 campos)
-                'disco2_capacidad', 'disco2_tipo', 'disco2_serial', 'disco2_marca', 'disco2_modelo',
-                # Resto
-                'uso_navegador_web', 'version_office', 'licencia_office',
-                'uso_teams', 'uso_outlook', 'licencia_windows', 'key_windows',
-                'estado_licencia_windows', 'direccion_ip', 'tipo_conexion',
-                'antivirus_instalado', 'ultima_act_windows', 'windows_update_activo'
-            ]
+            'marca', 'modelo', 'serial', 'sistema_operativo', 'arquitectura_so',
+            'procesador', 'ram_gb',
+            # DISCO 1 (5 campos)
+            'disco1_capacidad', 'disco1_tipo', 'disco1_serial', 'disco1_marca', 'disco1_modelo',
+            # DISCO 2 (5 campos)
+            'disco2_capacidad', 'disco2_tipo', 'disco2_serial', 'disco2_marca', 'disco2_modelo',
+            # Resto
+            'uso_navegador_web', 'version_office', 'licencia_office',
+            'uso_teams', 'uso_outlook', 'licencia_windows', 'key_windows',
+            'estado_licencia_windows', 
+            'direccion_ip',           # IP local
+            'mac_address',           
+            'tipo_conexion',
+            'navegador_predeterminado',  
+            'unidades_red_mapeadas',     
+            'antivirus_instalado', 'ultima_act_windows', 'windows_update_activo'
+        ]
             
             for field in verde_fields:
                 value = self.verde_data.get(field, '')
@@ -2119,17 +2347,6 @@ class InventoryManagerApp:
                 value = self.azul_data.get(field, '')
                 ws.cell(row=row, column=col, value=value)
                 col += 1
-            
-            # ===== COLUMNA FINAL: Antigüedad (CALCULADA) =====
-            fecha_adq = self.equipment_data.get('fecha_adquisicion', '')
-            if fecha_adq:
-                try:
-                    fecha = datetime.strptime(fecha_adq, '%Y-%m-%d')
-                    hoy = datetime.now()
-                    antiguedad = round((hoy - fecha).days / 365.25, 1)
-                    ws.cell(row=row, column=col, value=antiguedad)
-                except:
-                    ws.cell(row=row, column=col, value='')
             
             # Guardar
             wb.save(self.excel_path)
@@ -2222,17 +2439,17 @@ class InventoryManagerApp:
         # ===== GUARDAR EN EXCEL =====
         try:
             # Abrir Excel
-            if not os.path.exists(EXCEL_FILE):
-                messagebox.showerror("Error", f"No se encontró el archivo: {EXCEL_FILE}")
+            if not os.path.exists(self.excel_path):
+                messagebox.showerror("Error", f"No se encontró el archivo: {self.excel_path}")
                 return
             
-            wb = openpyxl.load_workbook(EXCEL_FILE)
+            wb = openpyxl.load_workbook(self.excel_path)
             
-            if SHEET_EQUIPOS not in wb.sheetnames:
-                messagebox.showerror("Error", f"No se encontró la hoja: {SHEET_EQUIPOS}")
+            if "Equipos de Cómputo" not in wb.sheetnames:
+                messagebox.showerror("Error", f"No se encontró la hoja: {"Equipos de Cómputo"}")
                 return
             
-            ws = wb[SHEET_EQUIPOS]
+            ws = wb["Equipos de Cómputo"]
             
             # Obtener siguiente consecutivo y código
             next_consecutivo = self.get_next_consecutivo()
@@ -2263,7 +2480,6 @@ class InventoryManagerApp:
             
             # Cols 11-16: Software (NARANJA)
             ws.cell(row=nueva_fila, column=11).value = datos_guardados.get('uso_sihos', '')
-            ws.cell(row=nueva_fila, column=12).value = datos_guardados.get('uso_sifax', '')
             ws.cell(row=nueva_fila, column=13).value = datos_guardados.get('uso_office_basico', '')
             ws.cell(row=nueva_fila, column=14).value = datos_guardados.get('software_especializado', '')
             ws.cell(row=nueva_fila, column=15).value = datos_guardados.get('descripcion_software', '')
@@ -2285,16 +2501,9 @@ class InventoryManagerApp:
             # Cols 35-46: Operativos (NARANJA)
             ws.cell(row=nueva_fila, column=35).value = datos_guardados.get('horario_uso', '')
             ws.cell(row=nueva_fila, column=36).value = datos_guardados.get('estado_operativo', '')
-            ws.cell(row=nueva_fila, column=37).value = datos_guardados.get('fecha_adquisicion', '')
-            ws.cell(row=nueva_fila, column=38).value = datos_guardados.get('valor_adquisicion', '')
-            ws.cell(row=nueva_fila, column=39).value = datos_guardados.get('fecha_venc_garantia', '')
-            ws.cell(row=nueva_fila, column=40).value = datos_guardados.get('observaciones_tecnicas', '')
-            ws.cell(row=nueva_fila, column=41).value = datos_guardados.get('fecha_exp_antivirus', '')
-            ws.cell(row=nueva_fila, column=42).value = datos_guardados.get('periodicidad_mtto', '')
-            ws.cell(row=nueva_fila, column=43).value = datos_guardados.get('responsable_mtto', '')
-            ws.cell(row=nueva_fila, column=44).value = datos_guardados.get('ultimo_mantenimiento', '')
-            ws.cell(row=nueva_fila, column=45).value = datos_guardados.get('tipo_ultimo_mtto', '')
-            ws.cell(row=nueva_fila, column=46).value = datos_guardados.get('reservada', '')
+            ws.cell(row=nueva_fila, column=37).value = datos_guardados.get('observaciones_tecnicas', '')
+            ws.cell(row=nueva_fila, column=38).value = datos_guardados.get('periodicidad_mtto', '')
+            ws.cell(row=nueva_fila, column=39).value = datos_guardados.get('responsable_mtto', '')
             
             # Cols 47-77: Hardware/Software (VERDE) - Vacíos por ahora
             for col in range(47, 78):
@@ -2304,11 +2513,8 @@ class InventoryManagerApp:
             for col in range(78, 85):
                 ws.cell(row=nueva_fila, column=col).value = ''
             
-            # Col 85: Antigüedad - Vacío por ahora
-            ws.cell(row=nueva_fila, column=85).value = ''
-            
             # Guardar
-            wb.save(EXCEL_FILE)
+            wb.save(self.excel_path)
             wb.close()
             
             messagebox.showinfo(
@@ -2332,9 +2538,6 @@ class InventoryManagerApp:
                             widget.set('')
                 except:
                     pass
-            
-            # Recargar tabla
-            self.load_data()
             
         except Exception as e:
             messagebox.showerror(
@@ -2405,13 +2608,11 @@ class InventoryManagerApp:
                 # Cargar datos NARANJAS (columnas 4-27)
                 naranja_fields = [
                     'tipo_equipo', 'area_servicio', 'ubicacion_especifica',
-                    'responsable_custodio', 'proceso', 'uso_sihos', 'uso_sifax',
+                    'responsable_custodio', 'proceso', 'uso_sihos',
                     'uso_office_basico', 'software_especializado', 'descripcion_software',
                     'funcion_principal', 'criticidad', 'confidencialidad',
-                    'horario_uso', 'estado_operativo', 'fecha_adquisicion',
-                    'valor_adquisicion', 'fecha_venc_garantia', 'observaciones_tecnicas',
-                    'fecha_exp_antivirus', 'periodicidad_mtto', 'responsable_mtto',
-                    'ultimo_mantenimiento', 'tipo_ultimo_mtto'
+                    'horario_uso', 'estado_operativo', 'observaciones_tecnicas', 
+                    'periodicidad_mtto', 'responsable_mtto'
                 ]
                 
                 col = 4
@@ -2535,13 +2736,10 @@ class InventoryManagerApp:
             col = 4
             naranja_fields = [
                 'tipo_equipo', 'area_servicio', 'ubicacion_especifica',
-                'responsable_custodio', 'proceso', 'uso_sihos', 'uso_sifax',
+                'responsable_custodio', 'proceso', 'uso_sihos',
                 'uso_office_basico', 'software_especializado', 'descripcion_software',
-                'funcion_principal', 'criticidad', 'confidencialidad',
-                'horario_uso', 'estado_operativo', 'fecha_adquisicion',
-                'valor_adquisicion', 'fecha_venc_garantia', 'observaciones_tecnicas',
-                'fecha_exp_antivirus', 'periodicidad_mtto', 'responsable_mtto',
-                'ultimo_mantenimiento', 'tipo_ultimo_mtto'
+                'funcion_principal','horario_uso', 'estado_operativo', 'observaciones_tecnicas',
+                'periodicidad_mtto', 'responsable_mtto'
             ]
             
             # Leer de widgets directamente con verificación (igual que save_equipo_manual_only)
@@ -2616,9 +2814,9 @@ Código: {code}
 Nombre: {nombre}
 Área: {area}
 
-✓ Datos manuales (24 campos): Guardados
-✓ Datos automáticos (22 campos): Guardados
-✓ Datos mixtos (7 campos): Guardados
+✓ Datos manuales: Guardados
+✓ Datos automáticos: Guardados
+✓ Datos mixtos: Guardados
 ✓ Excel actualizado correctamente
 
 Total: 56 columnas completas
@@ -2715,8 +2913,6 @@ Total: 56 columnas completas
             ("Función *", "funcion", "combobox", FUNCIONES_IMPRESORA),
             ("Dirección IP", "ip", "entry"),
             ("Estado Operativo *", "estado", "combobox", ESTADOS_IMPRESORA),
-            ("Fecha de Adquisición (YYYY-MM-DD)", "fecha_adq", "entry"),
-            ("Valor de Adquisición (COP)", "valor", "entry"),
             ("Observaciones", "observaciones", "entry"),
         ]
         
@@ -2793,8 +2989,6 @@ Total: 56 columnas completas
                 ws.cell(row=row, column=10, value=self.imp_widgets["funcion"].get())
                 ws.cell(row=row, column=11, value=self.imp_widgets["ip"].get())
                 ws.cell(row=row, column=12, value=self.imp_widgets["estado"].get())
-                ws.cell(row=row, column=13, value=self.imp_widgets["fecha_adq"].get())
-                ws.cell(row=row, column=14, value=self.imp_widgets["valor"].get())
                 ws.cell(row=row, column=15, value=self.imp_widgets["observaciones"].get())
                 
                 wb.save(self.excel_path)
@@ -2859,8 +3053,6 @@ Total: 56 columnas completas
                 ws.cell(row=next_row, column=10, value=self.imp_widgets["funcion"].get())
                 ws.cell(row=next_row, column=11, value=self.imp_widgets["ip"].get())
                 ws.cell(row=next_row, column=12, value=self.imp_widgets["estado"].get())
-                ws.cell(row=next_row, column=13, value=self.imp_widgets["fecha_adq"].get())
-                ws.cell(row=next_row, column=14, value=self.imp_widgets["valor"].get())
                 ws.cell(row=next_row, column=15, value=self.imp_widgets["observaciones"].get())
                 
                 wb.save(self.excel_path)
@@ -2974,13 +3166,6 @@ Total: 56 columnas completas
                 
                 self.imp_widgets["estado"].set(ws.cell(row=target_row, column=12).value or "")
                 
-                self.imp_widgets["fecha_adq"].delete(0, "end")
-                fecha_val = ws.cell(row=target_row, column=13).value
-                self.imp_widgets["fecha_adq"].insert(0, str(fecha_val) if fecha_val else "")
-                
-                self.imp_widgets["valor"].delete(0, "end")
-                self.imp_widgets["valor"].insert(0, ws.cell(row=target_row, column=14).value or "")
-                
                 self.imp_widgets["observaciones"].delete(0, "end")
                 self.imp_widgets["observaciones"].insert(0, ws.cell(row=target_row, column=15).value or "")
                 
@@ -3051,7 +3236,6 @@ Total: 56 columnas completas
             ("Serial", "serial", "entry"),
             ("Área / Servicio *", "area", "combobox", AREAS_SERVICIO),
             ("Estado Operativo *", "estado", "combobox", ESTADOS_PERIFERICO),
-            ("Fecha de Adquisición (YYYY-MM-DD)", "fecha_adq", "entry"),
             ("Observaciones", "observaciones", "entry"),
         ]
         
@@ -3125,7 +3309,6 @@ Total: 56 columnas completas
                 ws.cell(row=row, column=7, value=self.per_widgets["serial"].get())
                 ws.cell(row=row, column=8, value=self.per_widgets["area"].get())
                 ws.cell(row=row, column=9, value=self.per_widgets["estado"].get())
-                ws.cell(row=row, column=10, value=self.per_widgets["fecha_adq"].get())
                 ws.cell(row=row, column=11, value=self.per_widgets["observaciones"].get())
                 
                 wb.save(self.excel_path)
@@ -3186,7 +3369,6 @@ Total: 56 columnas completas
                 ws.cell(row=next_row, column=7, value=self.per_widgets["serial"].get())
                 ws.cell(row=next_row, column=8, value=self.per_widgets["area"].get())
                 ws.cell(row=next_row, column=9, value=self.per_widgets["estado"].get())
-                ws.cell(row=next_row, column=10, value=self.per_widgets["fecha_adq"].get())
                 ws.cell(row=next_row, column=11, value=self.per_widgets["observaciones"].get())
                 
                 wb.save(self.excel_path)
@@ -3289,10 +3471,6 @@ Total: 56 columnas completas
                 self.per_widgets["area"].set(ws.cell(row=target_row, column=8).value or "")
                 self.per_widgets["estado"].set(ws.cell(row=target_row, column=9).value or "")
                 
-                self.per_widgets["fecha_adq"].delete(0, "end")
-                fecha_val = ws.cell(row=target_row, column=10).value
-                self.per_widgets["fecha_adq"].insert(0, str(fecha_val) if fecha_val else "")
-                
                 self.per_widgets["observaciones"].delete(0, "end")
                 self.per_widgets["observaciones"].insert(0, ws.cell(row=target_row, column=11).value or "")
                 
@@ -3361,8 +3539,6 @@ Total: 56 columnas completas
             ("Ubicación *", "ubicacion", "combobox", UBICACIONES_RED),
             ("Área / Servicio", "area", "combobox", AREAS_SERVICIO),
             ("Estado Operativo *", "estado", "combobox", ESTADOS_RED),
-            ("Fecha de Adquisición (YYYY-MM-DD)", "fecha_adq", "entry"),
-            ("Valor de Adquisición (COP)", "valor", "entry"),
             ("Observaciones", "observaciones", "entry"),
         ]
         
@@ -3438,8 +3614,6 @@ Total: 56 columnas completas
                 ws.cell(row=row, column=9, value=self.red_widgets["ubicacion"].get())
                 ws.cell(row=row, column=10, value=self.red_widgets["area"].get())
                 ws.cell(row=row, column=11, value=self.red_widgets["estado"].get())
-                ws.cell(row=row, column=12, value=self.red_widgets["fecha_adq"].get())
-                ws.cell(row=row, column=13, value=self.red_widgets["valor"].get())
                 ws.cell(row=row, column=14, value=self.red_widgets["observaciones"].get())
                 
                 wb.save(self.excel_path)
@@ -3502,8 +3676,6 @@ Total: 56 columnas completas
                 ws.cell(row=next_row, column=9, value=self.red_widgets["ubicacion"].get())
                 ws.cell(row=next_row, column=10, value=self.red_widgets["area"].get())
                 ws.cell(row=next_row, column=11, value=self.red_widgets["estado"].get())
-                ws.cell(row=next_row, column=12, value=self.red_widgets["fecha_adq"].get())
-                ws.cell(row=next_row, column=13, value=self.red_widgets["valor"].get())
                 ws.cell(row=next_row, column=14, value=self.red_widgets["observaciones"].get())
                 
                 wb.save(self.excel_path)
@@ -3609,13 +3781,6 @@ Total: 56 columnas completas
                 self.red_widgets["area"].set(ws.cell(row=target_row, column=10).value or "")
                 self.red_widgets["estado"].set(ws.cell(row=target_row, column=11).value or "")
                 
-                self.red_widgets["fecha_adq"].delete(0, "end")
-                fecha_val = ws.cell(row=target_row, column=12).value
-                self.red_widgets["fecha_adq"].insert(0, str(fecha_val) if fecha_val else "")
-                
-                self.red_widgets["valor"].delete(0, "end")
-                self.red_widgets["valor"].insert(0, ws.cell(row=target_row, column=13).value or "")
-                
                 self.red_widgets["observaciones"].delete(0, "end")
                 self.red_widgets["observaciones"].insert(0, ws.cell(row=target_row, column=14).value or "")
                 
@@ -3676,16 +3841,17 @@ Total: 56 columnas completas
         
         fields = [
             ("Código Equipo *", "codigo_equipo", "entry"),
-            ("Fecha Mantenimiento (YYYY-MM-DD) *", "fecha_mtto", "entry"),
             ("Tipo Mantenimiento *", "tipo", "combobox", TIPOS_MANTENIMIENTO_MTTO),
             ("Técnico Responsable *", "tecnico", "combobox", TECNICOS_RESPONSABLES),
             ("Descripción Actividades *", "descripcion", "combobox", ACTIVIDADES_MANTENIMIENTO),
             ("Repuestos/Insumos", "repuestos", "entry"),
             ("Estado Post-Mtto *", "estado_post", "combobox", ESTADO_POST_MTTO),
-            ("Próximo Mantenimiento (YYYY-MM-DD)", "proximo", "entry"),
             ("Observaciones", "observaciones", "entry"),
         ]
-        
+
+        self.create_date_field_centered(scroll, "Fecha Mantenimiento *", "fecha_mtto")
+        self.create_date_field_centered(scroll, "Próximo Mantenimiento", "proximo")
+
         for field_data in fields:
             if len(field_data) == 4:
                 label, key, field_type, options = field_data
@@ -3726,7 +3892,7 @@ Total: 56 columnas completas
             
             ws.cell(row=next_row, column=1, value=consecutive)
             ws.cell(row=next_row, column=2, value=self.mtt_widgets["codigo_equipo"].get())
-            ws.cell(row=next_row, column=3, value=self.mtt_widgets["fecha_mtto"].get())
+            ws.cell(row=next_row, column=3, value=self.get_date_value(self.mtt_widgets["fecha_mtto"]))
             ws.cell(row=next_row, column=4, value=self.mtt_widgets["tipo"].get())
             ws.cell(row=next_row, column=5, value=self.mtt_widgets["tecnico"].get())
             ws.cell(row=next_row, column=6, value=self.mtt_widgets["descripcion"].get())
@@ -3783,12 +3949,13 @@ Total: 56 columnas completas
             ("Marca", "marca", "entry"),
             ("Modelo", "modelo", "entry"),
             ("Serial", "serial", "entry"),
-            ("Fecha de Baja (YYYY-MM-DD) *", "fecha_baja", "entry"),
             ("Motivo Baja *", "motivo", "combobox", MOTIVOS_BAJA),
             ("Destino *", "destino", "combobox", DESTINOS_BAJA),
             ("Responsable Baja *", "responsable", "combobox", RESPONSABLES_BAJA),
             ("Observaciones", "observaciones", "entry"),
         ]
+
+        self.create_date_field_centered(scroll, "Fecha de Baja *", "fecha_baja")
         
         for field_data in fields:
             if len(field_data) == 4:
@@ -3949,7 +4116,7 @@ Total: 56 columnas completas
             ws_baja.cell(row=next_row, column=3, value=self.baja_widgets["marca"].get())
             ws_baja.cell(row=next_row, column=4, value=self.baja_widgets["modelo"].get())
             ws_baja.cell(row=next_row, column=5, value=self.baja_widgets["serial"].get())
-            ws_baja.cell(row=next_row, column=6, value=self.baja_widgets["fecha_baja"].get())
+            ws_baja.cell(row=next_row, column=6, value=self.get_date_value(self.baja_widgets["fecha_baja"]))
             ws_baja.cell(row=next_row, column=7, value=self.baja_widgets["motivo"].get())
             ws_baja.cell(row=next_row, column=8, value=self.baja_widgets["destino"].get())
             ws_baja.cell(row=next_row, column=9, value=self.baja_widgets["responsable"].get())
