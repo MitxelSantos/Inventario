@@ -748,13 +748,14 @@ class InventoryManagerApp:
         except:
             codigo_text = "Equipo: EQC-0001"
         
-        title_label = ctk.CTkLabel(
+        # GUARDAR REFERENCIA AL TÍTULO PARA ACTUALIZARLO DESPUÉS
+        self.form_title_label = ctk.CTkLabel(
             title_frame,
             text=f"{codigo_text}",
             font=("Segoe UI", 16, "bold"),
             text_color="white"
         )
-        title_label.pack(pady=15)
+        self.form_title_label.pack(pady=15)
         
         # ===== CAMPOS BÁSICOS =====
         self.create_form_field_centered(form_frame, "Tipo de Equipo", "tipo_equipo", 
@@ -1552,15 +1553,27 @@ class InventoryManagerApp:
     
     def get_date_value(self, widget):
         """
-        Obtener valor de fecha de un widget (DateEntry o Entry).
+        Obtener valor de fecha de un widget de forma segura.
+        Funciona con DateEntry, Entry y ComboBox.
         
         Returns:
             str: Fecha en formato YYYY-MM-DD o cadena vacía
         """
         try:
-            date_obj = widget.get_date()
-            return date_obj.strftime('%Y-%m-%d')
-        except:
+            # DateEntry (tkcalendar)
+            if hasattr(widget, 'get_date'):
+                date_obj = widget.get_date()
+                return date_obj.strftime('%Y-%m-%d')
+            
+            # Entry o ComboBox con texto
+            elif hasattr(widget, 'get'):
+                value = widget.get().strip()
+                return value if value else ''
+            
+            else:
+                return ''
+        except Exception as e:
+            print(f"Error obteniendo fecha: {e}")
             return ''
     
     def create_radio_field_centered(self, parent, label_text, field_name, tooltip_text=None):
@@ -2486,17 +2499,18 @@ class InventoryManagerApp:
         
         for field_name, widget in self.manual_widgets.items():
             try:
-                if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
+                # ⚠️ CRÍTICO: StringVar NO tiene winfo_exists() - verificar PRIMERO
+                if isinstance(widget, tk.StringVar):
+                    datos_guardados[field_name] = widget.get()
+                
+                # Widgets de CTk - SÍ tienen winfo_exists()
+                elif hasattr(widget, 'winfo_exists') and widget.winfo_exists():
                     # Entry (campos de texto)
                     if isinstance(widget, ctk.CTkEntry):
                         datos_guardados[field_name] = widget.get()
                     
                     # ComboBox (listas desplegables)
                     elif isinstance(widget, ctk.CTkComboBox):
-                        datos_guardados[field_name] = widget.get()
-                    
-                    # StringVar (RadioButtons)
-                    elif isinstance(widget, tk.StringVar):
                         datos_guardados[field_name] = widget.get()
                     
                     else:
@@ -2529,27 +2543,30 @@ class InventoryManagerApp:
             # ===== BUSCAR ÚLTIMO CONSECUTIVO Y PRIMERA FILA VACÍA =====
             # Buscar ÚLTIMA fila con datos (para consecutivo correcto)
             last_consecutive = 0
+            primera_fila_vacia = 2  # Por defecto
+
             for row in range(2, 500):
                 value = ws.cell(row=row, column=1).value
+                
                 if value is not None:
+                    # Hay datos - actualizar consecutivo
                     try:
                         consecutivo = int(value)
                         if consecutivo > last_consecutive:
                             last_consecutive = consecutivo
                     except:
                         pass
-            
-            # Siguiente consecutivo
+                else:
+                    # Primera fila vacía encontrada
+                    primera_fila_vacia = row
+                    break
+
+            # Siguiente consecutivo (si no hay datos, empieza en 1)
             next_consecutivo = last_consecutive + 1
             next_codigo = f"EQC-{next_consecutivo:04d}"
-            
-            # Buscar PRIMERA fila vacía (para insertar datos)
-            nueva_fila = 2  # Por defecto, fila 2
-            for row in range(2, 500):
-                # Verificar si la fila está completamente vacía
-                if ws.cell(row=row, column=1).value is None:
-                    nueva_fila = row
-                    break
+            nueva_fila = primera_fila_vacia
+
+            print(f"DEBUG: last_consecutive={last_consecutive}, next_consecutivo={next_consecutivo}, nueva_fila={nueva_fila}")
             
             # ===== MAPEO A 80 COLUMNAS (VERSION ACTUAL) =====
             
@@ -2569,51 +2586,40 @@ class InventoryManagerApp:
             ws.cell(row=nueva_fila, column=9).value = datos_guardados.get('proceso', '')
             ws.cell(row=nueva_fila, column=10).value = datos_guardados.get('subproceso', '')
             
-            # Cols 11-16: Software (NARANJA)
+            # Cols 11-15: Software (NARANJA)
             ws.cell(row=nueva_fila, column=11).value = datos_guardados.get('uso_sihos', '')
-            ws.cell(row=nueva_fila, column=12).value = datos_guardados.get('uso_sifax', '')
-            ws.cell(row=nueva_fila, column=13).value = datos_guardados.get('uso_office_basico', '')
-            ws.cell(row=nueva_fila, column=14).value = datos_guardados.get('software_especializado', '')
-            ws.cell(row=nueva_fila, column=15).value = datos_guardados.get('descripcion_software', '')
-            ws.cell(row=nueva_fila, column=16).value = datos_guardados.get('funcion_principal', '')
+            ws.cell(row=nueva_fila, column=12).value = datos_guardados.get('uso_office_basico', '')
+            ws.cell(row=nueva_fila, column=13).value = datos_guardados.get('software_especializado', '')
+            ws.cell(row=nueva_fila, column=14).value = datos_guardados.get('descripcion_software', '')
+            ws.cell(row=nueva_fila, column=15).value = datos_guardados.get('funcion_principal', '')
             
-            # Cols 17-34: Cuestionario 18 preguntas (NARANJA)
+            # Cols 16-33: Cuestionario 18 preguntas (NARANJA)
             # CONFIDENCIALIDAD (9)
             for i in range(1, 10):
-                ws.cell(row=nueva_fila, column=16 + i).value = datos_guardados.get(f'conf_{i}', '')
-            
+                ws.cell(row=nueva_fila, column=15 + i).value = datos_guardados.get(f'conf_{i}', '')
+
             # INTEGRIDAD (3)
             for i in range(1, 4):
-                ws.cell(row=nueva_fila, column=25 + i).value = datos_guardados.get(f'int_{i}', '')
-            
+                ws.cell(row=nueva_fila, column=24 + i).value = datos_guardados.get(f'int_{i}', '')
+
             # CRITICIDAD (6)
             for i in range(1, 7):
-                ws.cell(row=nueva_fila, column=28 + i).value = datos_guardados.get(f'crit_{i}', '')
+                ws.cell(row=nueva_fila, column=27 + i).value = datos_guardados.get(f'crit_{i}', '')
             
-            # Cols 35-46: Operativos (NARANJA)
-            ws.cell(row=nueva_fila, column=35).value = datos_guardados.get('horario_uso', '')
-            ws.cell(row=nueva_fila, column=36).value = datos_guardados.get('estado_operativo', '')
-            ws.cell(row=nueva_fila, column=37).value = datos_guardados.get('fecha_adquisicion', '')
-            ws.cell(row=nueva_fila, column=38).value = datos_guardados.get('valor_adquisicion', '')
-            ws.cell(row=nueva_fila, column=39).value = datos_guardados.get('fecha_venc_garantia', '')
-            ws.cell(row=nueva_fila, column=40).value = datos_guardados.get('observaciones_tecnicas', '')
-            ws.cell(row=nueva_fila, column=41).value = datos_guardados.get('fecha_exp_antivirus', '')
-            ws.cell(row=nueva_fila, column=42).value = datos_guardados.get('periodicidad_mtto', '')
-            ws.cell(row=nueva_fila, column=43).value = datos_guardados.get('responsable_mtto', '')
-            ws.cell(row=nueva_fila, column=44).value = datos_guardados.get('ultimo_mantenimiento', '')
-            ws.cell(row=nueva_fila, column=45).value = datos_guardados.get('tipo_ultimo_mtto', '')
-            ws.cell(row=nueva_fila, column=46).value = datos_guardados.get('reservada', '')
+            # Cols 34-38: Operativos (NARANJA) - Solo 5 campos
+            ws.cell(row=nueva_fila, column=34).value = datos_guardados.get('horario_uso', '')
+            ws.cell(row=nueva_fila, column=35).value = datos_guardados.get('estado_operativo', '')
+            ws.cell(row=nueva_fila, column=36).value = datos_guardados.get('observaciones_tecnicas', '')
+            ws.cell(row=nueva_fila, column=37).value = datos_guardados.get('periodicidad_mtto', '')
+            ws.cell(row=nueva_fila, column=38).value = datos_guardados.get('responsable_mtto', '')
             
-            # Cols 47-77: Hardware/Software (VERDE) - Vacíos por ahora
-            for col in range(47, 78):
+            # Cols 39-71: Hardware/Software (VERDE) - Vacíos por ahora
+            for col in range(39, 72):
                 ws.cell(row=nueva_fila, column=col).value = ''
-            
-            # Cols 78-84: Mixtos (AZUL) - Vacíos por ahora
-            for col in range(78, 85):
+
+            # Cols 72-78: Mixtos (AZUL) - Vacíos por ahora
+            for col in range(72, 79):
                 ws.cell(row=nueva_fila, column=col).value = ''
-            
-            # Col 85: Antigüedad - Vacío por ahora
-            ws.cell(row=nueva_fila, column=85).value = ''
             
             # Guardar
             wb.save(self.excel_path)
@@ -2644,15 +2650,16 @@ class InventoryManagerApp:
             # Actualizar título del formulario con siguiente código
             next_consecutive_display = next_consecutivo + 1
             next_code_display = f"EQC-{next_consecutive_display:04d}"
-            
+
             # Actualizar título en el frame del formulario
             if hasattr(self, 'form_title_label'):
                 try:
-                    self.form_title_label.configure(
-                        text=f"📝 DATOS MANUALES - Equipo #{next_consecutive_display} (Código: {next_code_display})"
-                    )
-                except:
-                    pass
+                    if hasattr(self.form_title_label, 'winfo_exists') and self.form_title_label.winfo_exists():
+                        self.form_title_label.configure(
+                            text=f"Equipo: {next_code_display}"
+                        )
+                except Exception as e:
+                    print(f"Error actualizando título: {e}")
             
         except Exception as e:
             messagebox.showerror(
