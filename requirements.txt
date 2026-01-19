@@ -114,7 +114,7 @@ pywin32>=306; sys_platform == 'win32'
 # ✅ Optimización de código con funciones reutilizables
 # ✅ Mantenimientos sin campo de costo
 # ✅ Todos los códigos a 4 dígitos (E-, IMP-, PER-, RED-)
-
+python-dateutil>=2.8.2
 # ============================================================================
 # SOPORTE
 # ============================================================================

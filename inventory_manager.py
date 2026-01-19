@@ -22,6 +22,7 @@ import re
 import threading
 
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
 from pathlib import Path
 
 # Configurar tema CustomTkinter
@@ -1550,28 +1551,34 @@ class InventoryManagerApp:
         # Guardar widget
         self.manual_widgets[field_name] = widget
         return widget
-    
-    def get_date_value(self, widget):
+        
+    def get_date_value_safe(self, widget):
         """
-        Obtener valor de fecha de un widget de forma segura.
-        Funciona con DateEntry, Entry y ComboBox.
+        Obtener valor de fecha de forma segura desde DateEntry o Entry.
+        
+        Args:
+            widget: Widget DateEntry o Entry con fecha
         
         Returns:
             str: Fecha en formato YYYY-MM-DD o cadena vacía
         """
         try:
-            # DateEntry (tkcalendar)
+            # DateEntry de tkcalendar - tiene get_date()
             if hasattr(widget, 'get_date'):
                 date_obj = widget.get_date()
                 return date_obj.strftime('%Y-%m-%d')
             
-            # Entry o ComboBox con texto
+            # Entry normal - tiene get()
             elif hasattr(widget, 'get'):
-                value = widget.get().strip()
-                return value if value else ''
+                value = widget.get()
+                if isinstance(value, str):
+                    return value.strip()
+                else:
+                    return str(value)
             
             else:
                 return ''
+        
         except Exception as e:
             print(f"Error obteniendo fecha: {e}")
             return ''
@@ -1950,12 +1957,25 @@ class InventoryManagerApp:
         self.equipment_data = {}
         for field_name, widget in self.manual_widgets.items():
             try:
-                if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
+                # ⚠️ CRÍTICO: StringVar NO tiene winfo_exists() - verificar PRIMERO
+                if isinstance(widget, tk.StringVar):
                     value = widget.get().strip()
-                    if value and value != "Seleccionar...":
+                    if value and value != "":
                         self.equipment_data[field_name] = value
-            except:
-                pass  # Si falla, simplemente no guarda ese campo
+                
+                # Widgets de CTk - SÍ tienen winfo_exists()
+                elif hasattr(widget, 'winfo_exists') and widget.winfo_exists():
+                    if isinstance(widget, ctk.CTkEntry):
+                        value = widget.get().strip()
+                        if value:
+                            self.equipment_data[field_name] = value
+                    elif isinstance(widget, ctk.CTkComboBox):
+                        value = widget.get().strip()
+                        if value and value != "Seleccionar...":
+                            self.equipment_data[field_name] = value
+            except Exception as e:
+                print(f"Error capturando {field_name}: {e}")
+                pass
         
         # Mostrar ventana de progreso
         self.show_progress_window()
@@ -2315,7 +2335,7 @@ class InventoryManagerApp:
         self.show_completion_message()
     
     def save_to_excel(self):
-        """Guardar TODOS los datos en Excel."""
+        """Guardar TODOS los datos en Excel (después de recopilación automática)."""
         if not HAS_OPENPYXL:
             messagebox.showerror("Error", "Necesitas instalar openpyxl")
             return
@@ -2324,127 +2344,142 @@ class InventoryManagerApp:
             wb = load_workbook(self.excel_path)
             ws = wb["Equipos de Cómputo"]
             
-            # Verificar modo
-            if hasattr(self, 'equipo_update_row') and self.equipo_update_row:
-                # MODO ACTUALIZACIÓN
-                row = self.equipo_update_row
-                codigo = self.equipo_update_code
-                consecutive = int(codigo.split('-')[1])
-            else:
-                # MODO GUARDAR NUEVO
-                row = self.current_row
-                consecutive = row - 1
-                ws.cell(row=row, column=1, value=consecutive)
-                ws.cell(row=row, column=2, value=f"EQC-{consecutive:04d}")
+            # ===== BUSCAR ÚLTIMO CONSECUTIVO Y PRIMERA FILA VACÍA =====
+            last_consecutive = 0
+            primera_fila_vacia = 2
             
-            # ===== COLUMNA 3: Nombre Equipo (VERDE) =====
-            ws.cell(row=row, column=3, value=self.verde_data.get('nombre_equipo', ''))
+            for row in range(2, 500):
+                value = ws.cell(row=row, column=1).value
+                
+                if value is not None:
+                    try:
+                        consecutivo = int(value)
+                        if consecutivo > last_consecutive:
+                            last_consecutive = consecutivo
+                    except:
+                        pass
+                else:
+                    primera_fila_vacia = row
+                    break
             
-            # ===== COLUMNAS 4-50: NARANJAS (DATOS MANUALES) =====
-            col = 4
+            # Siguiente consecutivo
+            next_consecutivo = last_consecutive + 1
+            next_codigo = f"EQC-{next_consecutivo:04d}"
+            nueva_fila = primera_fila_vacia
             
-            # Campos básicos (7)
-            basic_fields = [
-                'tipo_equipo', 'area_servicio', 'ubicacion_especifica', 'responsable_custodio',
-                'macroproceso', 'proceso', 'subproceso'
-            ]
+            print(f"DEBUG AUTO: last_consecutive={last_consecutive}, next={next_consecutivo}, fila={nueva_fila}")
             
-            for field in basic_fields:
-                value = self.equipment_data.get(field, '')
-                ws.cell(row=row, column=col, value=value)
-                col += 1
+            # ===== COLUMNAS 1-3: IDENTIFICACIÓN =====
+            ws.cell(row=nueva_fila, column=1, value=next_consecutivo)
+            ws.cell(row=nueva_fila, column=2, value=next_codigo)
+            ws.cell(row=nueva_fila, column=3, value=self.verde_data.get('nombre_equipo', ''))
             
-            # Campos software (5)
-            software_fields = ['uso_sihos', 'uso_office_basico', 'software_especializado', 
-                            'descripcion_software', 'funcion_principal']
-            for field in software_fields:
-                value = self.equipment_data.get(field, '')
-                ws.cell(row=row, column=col, value=value)
-                col += 1
+            # ===== COLUMNAS 4-10: BÁSICOS (NARANJAS) =====
+            ws.cell(row=nueva_fila, column=4, value=self.equipment_data.get('tipo_equipo', ''))
+            ws.cell(row=nueva_fila, column=5, value=self.equipment_data.get('area_servicio', ''))
+            ws.cell(row=nueva_fila, column=6, value=self.equipment_data.get('ubicacion_especifica', ''))
+            ws.cell(row=nueva_fila, column=7, value=self.equipment_data.get('responsable_custodio', ''))
+            ws.cell(row=nueva_fila, column=8, value=self.equipment_data.get('macroproceso', ''))
+            ws.cell(row=nueva_fila, column=9, value=self.equipment_data.get('proceso', ''))
+            ws.cell(row=nueva_fila, column=10, value=self.equipment_data.get('subproceso', ''))
             
-            # ===== CUESTIONARIO DE CLASIFICACIÓN (18 PREGUNTAS) =====
-            # 9 Confidencialidad
+            # ===== COLUMNAS 11-15: SOFTWARE (NARANJAS) =====
+            ws.cell(row=nueva_fila, column=11, value=self.equipment_data.get('uso_sihos', ''))
+            ws.cell(row=nueva_fila, column=12, value=self.equipment_data.get('uso_office_basico', ''))
+            ws.cell(row=nueva_fila, column=13, value=self.equipment_data.get('software_especializado', ''))
+            ws.cell(row=nueva_fila, column=14, value=self.equipment_data.get('descripcion_software', ''))
+            ws.cell(row=nueva_fila, column=15, value=self.equipment_data.get('funcion_principal', ''))
+            
+            # ===== COLUMNAS 16-24: CONFIDENCIALIDAD (NARANJAS) =====
             for i in range(1, 10):
-                value = self.equipment_data.get(f'conf_{i}', '')
-                ws.cell(row=row, column=col, value=value)
-                col += 1
+                ws.cell(row=nueva_fila, column=15 + i, value=self.equipment_data.get(f'conf_{i}', ''))
             
-            # 3 Integridad
+            # ===== COLUMNAS 25-27: INTEGRIDAD (NARANJAS) =====
             for i in range(1, 4):
-                value = self.equipment_data.get(f'int_{i}', '')
-                ws.cell(row=row, column=col, value=value)
-                col += 1
+                ws.cell(row=nueva_fila, column=24 + i, value=self.equipment_data.get(f'int_{i}', ''))
             
-            # 6 Criticidad
+            # ===== COLUMNAS 28-33: CRITICIDAD (NARANJAS) =====
             for i in range(1, 7):
-                value = self.equipment_data.get(f'crit_{i}', '')
-                ws.cell(row=row, column=col, value=value)
-                col += 1
+                ws.cell(row=nueva_fila, column=27 + i, value=self.equipment_data.get(f'crit_{i}', ''))
             
-            # Campos finales (4) - SIN FECHAS NI VALORES
-            final_fields = [
-                'horario_uso', 'estado_operativo', 'observaciones_tecnicas',
-                'periodicidad_mtto', 'responsable_mtto'
-            ]
-            for field in final_fields:
-                value = self.equipment_data.get(field, '')
-                ws.cell(row=row, column=col, value=value)
-                col += 1
+            # ===== COLUMNAS 34-38: OPERATIVOS (NARANJAS) =====
+            ws.cell(row=nueva_fila, column=34, value=self.equipment_data.get('horario_uso', ''))
+            ws.cell(row=nueva_fila, column=35, value=self.equipment_data.get('estado_operativo', ''))
+            ws.cell(row=nueva_fila, column=36, value=self.equipment_data.get('observaciones_tecnicas', ''))
+            ws.cell(row=nueva_fila, column=37, value=self.equipment_data.get('periodicidad_mtto', ''))
+            ws.cell(row=nueva_fila, column=38, value=self.equipment_data.get('responsable_mtto', ''))
             
-            # TOTAL NARANJAS: 7 + 5 + 1 + 18 + 4 = 35 columnas
-            # Básicos (7) + Software (5) + Función (1) + Cuestionario (18) + Operativos (4)
+            # ===== COLUMNAS 39-45: HARDWARE (VERDES) =====
+            ws.cell(row=nueva_fila, column=39, value=self.verde_data.get('marca', ''))
+            ws.cell(row=nueva_fila, column=40, value=self.verde_data.get('modelo', ''))
+            ws.cell(row=nueva_fila, column=41, value=self.verde_data.get('serial', ''))
+            ws.cell(row=nueva_fila, column=42, value=self.verde_data.get('sistema_operativo', ''))
+            ws.cell(row=nueva_fila, column=43, value=self.verde_data.get('arquitectura_so', ''))
+            ws.cell(row=nueva_fila, column=44, value=self.verde_data.get('procesador', ''))
+            ws.cell(row=nueva_fila, column=45, value=self.verde_data.get('ram_gb', ''))
             
-            # ===== COLUMNAS VERDES (HARDWARE Y SOFTWARE) =====
-            verde_fields = [
-            'marca', 'modelo', 'serial', 'sistema_operativo', 'arquitectura_so',
-            'procesador', 'ram_gb',
-            # DISCO 1 (5 campos)
-            'disco1_capacidad', 'disco1_tipo', 'disco1_serial', 'disco1_marca', 'disco1_modelo',
-            # DISCO 2 (5 campos)
-            'disco2_capacidad', 'disco2_tipo', 'disco2_serial', 'disco2_marca', 'disco2_modelo',
-            # Resto
-            'uso_navegador_web', 'version_office', 'licencia_office',
-            'uso_teams', 'uso_outlook', 'licencia_windows', 'key_windows',
-            'estado_licencia_windows', 
-            'direccion_ip',           # IP local
-            'mac_address',           
-            'tipo_conexion',
-            'navegador_predeterminado',  
-            'unidades_red_mapeadas',     
-            'antivirus_instalado', 'ultima_act_windows', 'windows_update_activo'
-        ]
+            # ===== COLUMNAS 46-50: DISCO 1 (VERDES) =====
+            ws.cell(row=nueva_fila, column=46, value=self.verde_data.get('disco1_capacidad', ''))
+            ws.cell(row=nueva_fila, column=47, value=self.verde_data.get('disco1_tipo', ''))
+            ws.cell(row=nueva_fila, column=48, value=self.verde_data.get('disco1_serial', ''))
+            ws.cell(row=nueva_fila, column=49, value=self.verde_data.get('disco1_marca', ''))
+            ws.cell(row=nueva_fila, column=50, value=self.verde_data.get('disco1_modelo', ''))
             
-            for field in verde_fields:
-                value = self.verde_data.get(field, '')
-                ws.cell(row=row, column=col, value=value)
-                col += 1
+            # ===== COLUMNAS 51-55: DISCO 2 (VERDES) =====
+            ws.cell(row=nueva_fila, column=51, value=self.verde_data.get('disco2_capacidad', ''))
+            ws.cell(row=nueva_fila, column=52, value=self.verde_data.get('disco2_tipo', ''))
+            ws.cell(row=nueva_fila, column=53, value=self.verde_data.get('disco2_serial', ''))
+            ws.cell(row=nueva_fila, column=54, value=self.verde_data.get('disco2_marca', ''))
+            ws.cell(row=nueva_fila, column=55, value=self.verde_data.get('disco2_modelo', ''))
             
-            # ===== COLUMNAS AZULES (MIXTAS) =====
-            azul_fields = [
-                'switch_puerto', 'vlan_asignada', 'id_anydesk',
-                'otro_acceso_remoto', 'estado_antivirus',
-                'cifrado_disco', 'tipo_usuario_local'
-            ]
+            # ===== COLUMNAS 56-63: SOFTWARE (VERDES) =====
+            ws.cell(row=nueva_fila, column=56, value=self.verde_data.get('uso_navegador_web', ''))
+            ws.cell(row=nueva_fila, column=57, value=self.verde_data.get('version_office', ''))
+            ws.cell(row=nueva_fila, column=58, value=self.verde_data.get('licencia_office', ''))
+            ws.cell(row=nueva_fila, column=59, value=self.verde_data.get('uso_teams', ''))
+            ws.cell(row=nueva_fila, column=60, value=self.verde_data.get('uso_outlook', ''))
+            ws.cell(row=nueva_fila, column=61, value=self.verde_data.get('licencia_windows', ''))
+            ws.cell(row=nueva_fila, column=62, value=self.verde_data.get('key_windows', ''))
+            ws.cell(row=nueva_fila, column=63, value=self.verde_data.get('estado_licencia_windows', ''))
             
-            for field in azul_fields:
-                value = self.azul_data.get(field, '')
-                ws.cell(row=row, column=col, value=value)
-                col += 1
+            # ===== COLUMNAS 64-68: RED (VERDES) =====
+            ws.cell(row=nueva_fila, column=64, value=self.verde_data.get('direccion_ip', ''))
+            ws.cell(row=nueva_fila, column=65, value=self.verde_data.get('mac_address', ''))
+            ws.cell(row=nueva_fila, column=66, value=self.verde_data.get('tipo_conexion', ''))
+            ws.cell(row=nueva_fila, column=67, value=self.verde_data.get('navegador_predeterminado', ''))
+            ws.cell(row=nueva_fila, column=68, value=self.verde_data.get('unidades_red_mapeadas', ''))
+            
+            # ===== COLUMNAS 69-71: SEGURIDAD (VERDES) =====
+            ws.cell(row=nueva_fila, column=69, value=self.verde_data.get('antivirus_instalado', ''))
+            ws.cell(row=nueva_fila, column=70, value=self.verde_data.get('ultima_act_windows', ''))
+            ws.cell(row=nueva_fila, column=71, value=self.verde_data.get('windows_update_activo', ''))
+            
+            # ===== COLUMNAS 72-78: MIXTOS (AZULES) =====
+            ws.cell(row=nueva_fila, column=72, value=self.azul_data.get('switch_puerto', ''))
+            ws.cell(row=nueva_fila, column=73, value=self.azul_data.get('vlan_asignada', ''))
+            ws.cell(row=nueva_fila, column=74, value=self.azul_data.get('id_anydesk', ''))
+            ws.cell(row=nueva_fila, column=75, value=self.azul_data.get('otro_acceso_remoto', ''))
+            ws.cell(row=nueva_fila, column=76, value=self.azul_data.get('estado_antivirus', ''))
+            ws.cell(row=nueva_fila, column=77, value=self.azul_data.get('cifrado_disco', ''))
+            ws.cell(row=nueva_fila, column=78, value=self.azul_data.get('tipo_usuario_local', ''))
             
             # Guardar
             wb.save(self.excel_path)
             wb.close()
             
-            # Mensaje según modo
-            if hasattr(self, 'equipo_update_row') and self.equipo_update_row:
-                messagebox.showinfo("Éxito", f"✅ Equipo {codigo} actualizado correctamente (datos completos)")
-                self.reset_after_update_equipos()
-            else:
-                messagebox.showinfo("Éxito", f"✅ Equipo guardado: EQC-{consecutive:04d}")
-                self.current_row += 1
-                self.root.after(100, self.show_manual_form_in_container)
-                
+            print(f"✅ Guardado exitoso: {next_codigo} en fila {nueva_fila}")
+            
+            messagebox.showinfo("Éxito", f"✅ Equipo guardado: {next_codigo}\n\nDatos completos: 78 columnas")
+            
+            # Actualizar current_row para próximo equipo
+            self.current_row = nueva_fila + 1
+            
+            # Volver al formulario
+            self.root.after(100, self.show_manual_form_in_container)
+            
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             messagebox.showerror("Error", f"Error al guardar en Excel:\n{e}")
     
     def save_equipo_manual_only(self):
@@ -2893,7 +2928,7 @@ class InventoryManagerApp:
     
     def show_completion_message(self):
         """Mostrar mensaje de equipo completado."""
-        consecutive = self.current_row - 1
+        consecutive = self.current_row
         code = f"EQC-{consecutive:04d}"
         nombre = self.verde_data.get('nombre_equipo', 'N/A')
         area = self.equipment_data.get('area_servicio', 'N/A')
@@ -2940,8 +2975,6 @@ Nombre: {nombre}
 ✓ Datos automáticos: Guardados
 ✓ Datos mixtos: Guardados
 ✓ Excel actualizado correctamente
-
-Total: 56 columnas completas
         """
         
         info = ctk.CTkLabel(
@@ -3961,8 +3994,87 @@ Total: 56 columnas completas
         self.mtt_scroll = scroll  # Guardar referencia
         self.mtt_next_consecutive = next_consecutive
         
+        # Campo de código con botón de búsqueda
+        codigo_frame = ctk.CTkFrame(scroll, fg_color="white", corner_radius=8)
+        codigo_frame.pack(fill="x", padx=40, pady=6)
+
+        codigo_inner = ctk.CTkFrame(codigo_frame, fg_color="transparent")
+        codigo_inner.pack(fill="x", padx=20, pady=10)
+
+        codigo_inner.grid_columnconfigure(0, weight=3)
+        codigo_inner.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            codigo_inner,
+            text="Código Equipo *",
+            font=("Segoe UI", 12, "bold"),
+            anchor="w"
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        entry_codigo = ctk.CTkEntry(
+            codigo_inner,
+            height=35,
+            width=200,
+            font=("Segoe UI", 11),
+            placeholder_text="Ej: EQC-0001"
+        )
+        entry_codigo.grid(row=0, column=1, sticky="e", padx=(0, 10))
+
+        btn_buscar_mtto = ctk.CTkButton(
+            codigo_inner,
+            text="🔍 BUSCAR Y CARGAR",
+            command=self.buscar_equipo_mantenimiento,
+            font=("Segoe UI", 11, "bold"),
+            fg_color="#2196F3",
+            hover_color="#1976D2",
+            height=35,
+            width=180
+        )
+        btn_buscar_mtto.grid(row=0, column=2, sticky="e")
+
+        self.mtt_widgets["codigo_equipo"] = entry_codigo
+
+        # Campos autocompletados (readonly)
+        readonly_fields = [
+            ("Tipo Equipo", "tipo_equipo_readonly"),
+            ("Marca", "marca_readonly"),
+            ("Modelo", "modelo_readonly"),
+            ("Serial", "serial_readonly"),
+            ("Área", "area_readonly"),
+            ("Periodicidad", "periodicidad_readonly")
+        ]
+
+        for label_text, field_name in readonly_fields:
+            field_frame = ctk.CTkFrame(scroll, fg_color="#E8F5E9", corner_radius=8)
+            field_frame.pack(fill="x", padx=40, pady=6)
+            
+            inner_frame = ctk.CTkFrame(field_frame, fg_color="transparent")
+            inner_frame.pack(fill="x", padx=20, pady=10)
+            
+            inner_frame.grid_columnconfigure(0, weight=6)
+            inner_frame.grid_columnconfigure(1, weight=0, minsize=300)
+            
+            ctk.CTkLabel(
+                inner_frame,
+                text=label_text,
+                font=("Segoe UI", 12, "bold"),
+                anchor="w"
+            ).grid(row=0, column=0, sticky="w", padx=(0, 30))
+            
+            widget = ctk.CTkEntry(
+                inner_frame,
+                height=35,
+                width=300,
+                font=("Segoe UI", 11),
+                state="readonly",
+                fg_color="#F0F0F0"
+            )
+            widget.grid(row=0, column=1, sticky="e")
+            
+            self.mtt_widgets[field_name] = widget
+
+        # Resto de campos editables
         fields = [
-            ("Código Equipo *", "codigo_equipo", "entry"),
             ("Tipo Mantenimiento *", "tipo", "combobox", TIPOS_MANTENIMIENTO_MTTO),
             ("Técnico Responsable *", "tecnico", "combobox", TECNICOS_RESPONSABLES),
             ("Descripción Actividades *", "descripcion", "combobox", ACTIVIDADES_MANTENIMIENTO),
@@ -3972,6 +4084,43 @@ Total: 56 columnas completas
         ]
 
         self.create_date_field_centered(scroll, "Fecha Mantenimiento *", "fecha_mtto")
+
+        for field_data in fields:
+            if len(field_data) == 4:
+                label, key, field_type, options = field_data
+                widget = self.create_form_field_centered(scroll, label, key, field_type, options)
+            else:
+                label, key, field_type = field_data
+                widget = self.create_form_field_centered(scroll, label, key, field_type, None)
+            self.mtt_widgets[key] = widget
+
+        # Botón guardar (inicialmente deshabilitado)
+        self.btn_save_mantenimiento = ctk.CTkButton(
+            scroll,
+            text="💾 GUARDAR MANTENIMIENTO",
+            command=self.save_mantenimiento,
+            font=("Segoe UI", 14, "bold"),
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
+            height=50,
+            state="disabled"  # Deshabilitado hasta buscar equipo
+        )
+        self.btn_save_mantenimiento.pack(pady=30)
+
+        self.create_date_field_centered(scroll, "Fecha Mantenimiento *", "fecha_mtto")
+
+        # Botón para calcular próximo mantenimiento automáticamente
+        btn_calcular = ctk.CTkButton(
+            scroll,
+            text="🔄 CALCULAR PRÓXIMO MANTENIMIENTO AUTOMÁTICO",
+            command=self.calcular_proximo_mantenimiento,
+            font=("Segoe UI", 12, "bold"),
+            fg_color="#2196F3",
+            hover_color="#1976D2",
+            height=40
+        )
+        btn_calcular.pack(pady=10, padx=20, fill="x")
+
         self.create_date_field_centered(scroll, "Próximo Mantenimiento", "proximo")
 
         for field_data in fields:
@@ -3993,6 +4142,137 @@ Total: 56 columnas completas
             height=50
         )
         btn_save.pack(pady=30)
+
+    def buscar_equipo_mantenimiento(self):
+        """Buscar equipo y cargar datos para mantenimiento."""
+        codigo = self.mtt_widgets["codigo_equipo"].get().strip().upper()
+        
+        if not codigo:
+            messagebox.showerror("Error", "Ingresa un código de equipo")
+            return
+        
+        try:
+            wb = load_workbook(self.excel_path)
+            ws = wb["Equipos de Cómputo"]
+            
+            found = False
+            
+            for row in range(2, 500):
+                cell_codigo = ws.cell(row=row, column=2).value
+                if cell_codigo and cell_codigo.upper() == codigo:
+                    # Cargar datos
+                    tipo = ws.cell(row=row, column=4).value or ""
+                    marca = ws.cell(row=row, column=39).value or ""
+                    modelo = ws.cell(row=row, column=40).value or ""
+                    serial = ws.cell(row=row, column=41).value or ""
+                    area = ws.cell(row=row, column=5).value or ""
+                    periodicidad = ws.cell(row=row, column=37).value or ""
+                    
+                    # Actualizar campos readonly
+                    for field_name, value in [
+                        ("tipo_equipo_readonly", tipo),
+                        ("marca_readonly", marca),
+                        ("modelo_readonly", modelo),
+                        ("serial_readonly", serial),
+                        ("area_readonly", area),
+                        ("periodicidad_readonly", periodicidad)
+                    ]:
+                        widget = self.mtt_widgets[field_name]
+                        widget.configure(state="normal")
+                        widget.delete(0, "end")
+                        widget.insert(0, value)
+                        widget.configure(state="readonly")
+                    
+                    found = True
+                    break
+            
+            wb.close()
+            
+            if found:
+                # Habilitar botón de guardar
+                self.btn_save_mantenimiento.configure(state="normal")
+                messagebox.showinfo("Éxito", f"✅ Equipo {codigo} cargado correctamente")
+            else:
+                messagebox.showerror("Error", f"No se encontró el equipo {codigo}")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al buscar equipo:\n{e}")
+
+    def calcular_proximo_mantenimiento(self):
+        """Calcular próximo mantenimiento basado en periodicidad del equipo."""
+        from datetime import datetime, timedelta
+        from dateutil.relativedelta import relativedelta
+        
+        codigo = self.mtt_widgets["codigo_equipo"].get().strip().upper()
+        
+        if not codigo:
+            messagebox.showwarning("Advertencia", "Primero ingresa el código del equipo")
+            return
+        
+        try:
+            # Abrir Excel y buscar equipo
+            wb = load_workbook(self.excel_path)
+            ws = wb["Equipos de Cómputo"]
+            
+            found = False
+            periodicidad = None
+            
+            for row in range(2, 500):
+                cell_codigo = ws.cell(row=row, column=2).value
+                if cell_codigo and cell_codigo.upper() == codigo:
+                    # Columna 37 = Periodicidad Mantenimiento
+                    periodicidad = ws.cell(row=row, column=37).value
+                    found = True
+                    break
+            
+            wb.close()
+            
+            if not found:
+                messagebox.showerror("Error", f"No se encontró el equipo {codigo}")
+                return
+            
+            if not periodicidad:
+                messagebox.showwarning("Advertencia", 
+                    f"El equipo {codigo} no tiene periodicidad definida.\n\n"
+                    "Debes asignársela primero en el inventario.")
+                return
+            
+            # Obtener fecha de mantenimiento actual
+            try:
+                fecha_mtto = self.mtt_widgets["fecha_mtto"].get_date()
+            except:
+                messagebox.showwarning("Advertencia", "Primero selecciona la fecha de mantenimiento actual")
+                return
+            
+            # Calcular próximo mantenimiento
+            if "Semestral" in periodicidad:
+                proximo = fecha_mtto + relativedelta(months=6)
+            elif "Anual" in periodicidad:
+                proximo = fecha_mtto + relativedelta(months=12)
+            elif "Trimestral" in periodicidad:
+                proximo = fecha_mtto + relativedelta(months=3)
+            elif "Bimestral" in periodicidad:
+                proximo = fecha_mtto + relativedelta(months=2)
+            elif "Mensual" in periodicidad:
+                proximo = fecha_mtto + relativedelta(months=1)
+            else:
+                messagebox.showwarning("Advertencia", 
+                    f"Periodicidad '{periodicidad}' no reconocida.\n\n"
+                    "Opciones válidas: Mensual, Bimestral, Trimestral, Semestral, Anual")
+                return
+            
+            # Actualizar campo de próximo mantenimiento
+            self.mtt_widgets["proximo"].set_date(proximo)
+            
+            messagebox.showinfo("Éxito", 
+                f"✅ Próximo mantenimiento calculado:\n\n"
+                f"Equipo: {codigo}\n"
+                f"Periodicidad: {periodicidad}\n"
+                f"Fecha actual: {fecha_mtto.strftime('%Y-%m-%d')}\n"
+                f"Próximo: {proximo.strftime('%Y-%m-%d')}")
+        
+        except Exception as e:
+            messagebox.showerror("Error", f"Error al calcular próximo mantenimiento:\n{e}")
     
     def save_mantenimiento(self):
         """Guardar mantenimiento en Excel."""
@@ -4014,13 +4294,13 @@ Total: 56 columnas completas
             
             ws.cell(row=next_row, column=1, value=consecutive)
             ws.cell(row=next_row, column=2, value=self.mtt_widgets["codigo_equipo"].get())
-            ws.cell(row=next_row, column=3, value=self.get_date_value(self.mtt_widgets["fecha_mtto"]))
+            ws.cell(row=next_row, column=3, value=self.get_date_value_safe(self.mtt_widgets["fecha_mtto"]))
             ws.cell(row=next_row, column=4, value=self.mtt_widgets["tipo"].get())
             ws.cell(row=next_row, column=5, value=self.mtt_widgets["tecnico"].get())
             ws.cell(row=next_row, column=6, value=self.mtt_widgets["descripcion"].get())
             ws.cell(row=next_row, column=7, value=self.mtt_widgets["repuestos"].get())
             ws.cell(row=next_row, column=8, value=self.mtt_widgets["estado_post"].get())
-            ws.cell(row=next_row, column=9, value=self.mtt_widgets["proximo"].get())
+            ws.cell(row=next_row, column=9, value=self.get_date_value_safe(self.mtt_widgets["proximo"]))
             ws.cell(row=next_row, column=10, value=self.mtt_widgets["observaciones"].get())
             
             wb.save(self.excel_path)
@@ -4065,17 +4345,115 @@ Total: 56 columnas completas
         self.baja_scroll = scroll  # Guardar referencia
         self.baja_next = next_baja
         
+        # Campo de código con botón de búsqueda
+        codigo_frame = ctk.CTkFrame(scroll, fg_color="white", corner_radius=8)
+        codigo_frame.pack(fill="x", padx=40, pady=6)
+
+        codigo_inner = ctk.CTkFrame(codigo_frame, fg_color="transparent")
+        codigo_inner.pack(fill="x", padx=20, pady=10)
+
+        codigo_inner.grid_columnconfigure(0, weight=3)
+        codigo_inner.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            codigo_inner,
+            text="Código Original *",
+            font=("Segoe UI", 12, "bold"),
+            anchor="w"
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        entry_codigo = ctk.CTkEntry(
+            codigo_inner,
+            height=35,
+            width=200,
+            font=("Segoe UI", 11),
+            placeholder_text="Ej: EQC-0001"
+        )
+        entry_codigo.grid(row=0, column=1, sticky="e", padx=(0, 10))
+
+        btn_buscar_baja = ctk.CTkButton(
+            codigo_inner,
+            text="🔍 BUSCAR Y CARGAR",
+            command=self.buscar_equipo_baja_mejorado,
+            font=("Segoe UI", 11, "bold"),
+            fg_color="#2196F3",
+            hover_color="#1976D2",
+            height=35,
+            width=180
+        )
+        btn_buscar_baja.grid(row=0, column=2, sticky="e")
+
+        self.baja_widgets["codigo_original"] = entry_codigo
+
+        # Campos autocompletados (readonly)
+        readonly_fields_baja = [
+            ("Tipo", "tipo_readonly"),
+            ("Marca", "marca_readonly"),
+            ("Modelo", "modelo_readonly"),
+            ("Serial", "serial_readonly"),
+            ("Área", "area_readonly")
+        ]
+
+        for label_text, field_name in readonly_fields_baja:
+            field_frame = ctk.CTkFrame(scroll, fg_color="#FFE8E8", corner_radius=8)
+            field_frame.pack(fill="x", padx=40, pady=6)
+            
+            inner_frame = ctk.CTkFrame(field_frame, fg_color="transparent")
+            inner_frame.pack(fill="x", padx=20, pady=10)
+            
+            inner_frame.grid_columnconfigure(0, weight=6)
+            inner_frame.grid_columnconfigure(1, weight=0, minsize=300)
+            
+            ctk.CTkLabel(
+                inner_frame,
+                text=label_text,
+                font=("Segoe UI", 12, "bold"),
+                anchor="w"
+            ).grid(row=0, column=0, sticky="w", padx=(0, 30))
+            
+            widget = ctk.CTkEntry(
+                inner_frame,
+                height=35,
+                width=300,
+                font=("Segoe UI", 11),
+                state="readonly",
+                fg_color="#F0F0F0"
+            )
+            widget.grid(row=0, column=1, sticky="e")
+            
+            self.baja_widgets[field_name] = widget
+
+        # Resto de campos (fecha, motivo, etc.)
+        self.create_date_field_centered(scroll, "Fecha de Baja *", "fecha_baja")
+
         fields = [
-            ("Código Original *", "codigo_original", "entry"),
-            ("Tipo *", "tipo", "entry"),
-            ("Marca", "marca", "entry"),
-            ("Modelo", "modelo", "entry"),
-            ("Serial", "serial", "entry"),
             ("Motivo Baja *", "motivo", "combobox", MOTIVOS_BAJA),
             ("Destino *", "destino", "combobox", DESTINOS_BAJA),
             ("Responsable Baja *", "responsable", "combobox", RESPONSABLES_BAJA),
             ("Observaciones", "observaciones", "entry"),
         ]
+
+        for field_data in fields:
+            if len(field_data) == 4:
+                label, key, field_type, options = field_data
+                widget = self.create_form_field_centered(scroll, label, key, field_type, options)
+            else:
+                label, key, field_type = field_data
+                widget = self.create_form_field_centered(scroll, label, key, field_type, None)
+            self.baja_widgets[key] = widget
+
+        # Botón guardar (inicialmente deshabilitado)
+        self.btn_save_baja = ctk.CTkButton(
+            scroll,
+            text="💾 REGISTRAR BAJA",
+            command=self.save_baja,
+            font=("Segoe UI", 14, "bold"),
+            fg_color="#DC3545",
+            hover_color="#A02828",
+            height=50,
+            state="disabled"  # Deshabilitado hasta buscar equipo
+        )
+        self.btn_save_baja.pack(pady=30)
 
         self.create_date_field_centered(scroll, "Fecha de Baja *", "fecha_baja")
         
@@ -4238,7 +4616,7 @@ Total: 56 columnas completas
             ws_baja.cell(row=next_row, column=3, value=self.baja_widgets["marca"].get())
             ws_baja.cell(row=next_row, column=4, value=self.baja_widgets["modelo"].get())
             ws_baja.cell(row=next_row, column=5, value=self.baja_widgets["serial"].get())
-            ws_baja.cell(row=next_row, column=6, value=self.get_date_value(self.baja_widgets["fecha_baja"]))
+            ws_baja.cell(row=next_row, column=6, value=self.get_date_value_safe(self.baja_widgets["fecha_baja"]))
             ws_baja.cell(row=next_row, column=7, value=self.baja_widgets["motivo"].get())
             ws_baja.cell(row=next_row, column=8, value=self.baja_widgets["destino"].get())
             ws_baja.cell(row=next_row, column=9, value=self.baja_widgets["responsable"].get())
