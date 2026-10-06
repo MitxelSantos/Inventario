@@ -48,7 +48,11 @@ Thumbs.db
 # Archivos de usuario
 logo_hospital.png
 logo.png
+escudo_hospital.png
 hospital_logo.png
 
-# Datos sensibles
-inventario_hospital_v1.xlsx
+# Datos sensibles (no subir datos reales del hospital)
+# inventario_hospital_v1.xlsx  # Descomentar si no quieres subir datos reales
+
+# Streamlit
+.streamlit/secrets.toml
