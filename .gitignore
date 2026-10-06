@@ -52,7 +52,7 @@ escudo_hospital.png
 hospital_logo.png
 
 # Datos sensibles (no subir datos reales del hospital)
-# inventario_hospital_v1.xlsx  # Descomentar si no quieres subir datos reales
+inventario_hospital_v1*.xlsx
 
 # Streamlit
 .streamlit/secrets.toml
