@@ -10,7 +10,7 @@ FECHA: Enero 2026
 """
 
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, ttk
 from tkcalendar import DateEntry
 
 import customtkinter as ctk
@@ -20,6 +20,15 @@ import subprocess
 import os
 import re
 import threading
+import sys
+import json
+import time
+import shutil
+import zipfile
+import unicodedata
+import urllib.request
+import urllib.error
+import xml.etree.ElementTree as ET
 
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
@@ -142,53 +151,307 @@ def detect_hardware_wmi():
         'marca': 'No detectado',
         'modelo': 'No detectado',
         'serial': 'No detectado',
-        # DISCO 1 (Primario)
-        'disco1_capacidad': 'No detectado',  
-        'disco1_tipo': 'No detectado',      
+        'disco1_capacidad': 'No detectado',
+        'disco1_tipo': 'No detectado',
         'disco1_serial': 'No detectado',
         'disco1_marca': 'No detectado',
         'disco1_modelo': 'No detectado',
-        # DISCO 2 (Secundario)
         'disco2_capacidad': 'No tiene',
         'disco2_tipo': 'No tiene',
         'disco2_serial': 'No tiene',
         'disco2_marca': 'No tiene',
         'disco2_modelo': 'No tiene'
     }
-    
+
+    def _normalize_text(value):
+        text = str(value or '').strip()
+        if not text:
+            return ''
+        return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii').lower().strip()
+
+    def _is_placeholder(value):
+        normalized = _normalize_text(value)
+        if not normalized:
+            return True
+        if normalized.startswith('no detectado'):
+            return True
+        return normalized in {'no tiene', 'detectado', 'unknown', 'n/a', 'none', 'null'}
+
+    def _clean_disk_brand(value):
+        brand = str(value or '').strip()
+        normalized = _normalize_text(brand)
+        if not normalized:
+            return 'No detectado'
+        if 'standard disk' in normalized:
+            return 'No detectado'
+        if 'unidades de disco' in normalized or ('unidad' in normalized and 'disco' in normalized):
+            return 'No detectado'
+        return brand
+
+    def _infer_disk_type(media_type, model, interface_type=''):
+        data = f"{media_type or ''} {model or ''} {interface_type or ''}".upper()
+        if any(token in data for token in ['NVME', 'SSD', 'SOLID STATE']):
+            return 'SSD'
+        if any(token in data for token in ['HDD', 'ROTATIONAL', 'MAGNETIC']):
+            return 'HDD'
+        return 'No detectado'
+
+    def _derive_brand_from_model(model):
+        model_text = str(model or '').strip()
+        if not model_text:
+            return 'No detectado'
+        tokens = re.split(r"[\s_\-]+", model_text)
+        generic_tokens = {
+            'SSD', 'HDD', 'NVME', 'SATA', 'ATA', 'DISK', 'DRIVE', 'DEVICE', 'STORAGE', 'SOLID', 'STATE',
+            'GENERAL', 'MSFT', 'MICROSOFT', 'VIRTUAL'
+        }
+        for token in tokens:
+            cleaned = re.sub(r"[^A-Za-z0-9]", "", token).upper()
+            if len(cleaned) >= 3 and cleaned not in generic_tokens:
+                return cleaned
+        return 'No detectado'
+
+    def _is_virtual_disk(model, size_bytes, interface_type='', media_type=''):
+        model_text = str(model or '').upper()
+        interface_text = str(interface_type or '').upper()
+        media_text = str(media_type or '').upper()
+        virtual_tokens = ['VIRTUAL', 'VMWARE', 'VBOX', 'QEMU', 'MICROSOFT VIRTUAL', 'XENSRC', 'USB', 'UDISK']
+        if any(token in model_text for token in virtual_tokens):
+            return True
+        if 'USB' in interface_text or 'REMOVABLE' in media_text:
+            return True
+        try:
+            return int(size_bytes or 0) <= 0
+        except Exception:
+            return False
+
+    def _safe_round_gb(size_value):
+        try:
+            size_bytes = int(size_value or 0)
+            if size_bytes <= 0:
+                return 'No detectado', 0
+            return str(round(size_bytes / (1024 ** 3))), size_bytes
+        except Exception:
+            return 'No detectado', 0
+
+    def _detect_storage_api_disks():
+        cmd = (
+            "$d=Get-PhysicalDisk -ErrorAction SilentlyContinue | "
+            "Select-Object FriendlyName,Model,SerialNumber,MediaType,BusType,Size;"
+            "if($null -eq $d){'[]'} else {$d | ConvertTo-Json -Compress -Depth 4}"
+        )
+
+        output = _run_powershell(cmd, timeout=10)
+        if not output:
+            return []
+
+        try:
+            payload = json.loads(output)
+        except Exception:
+            return []
+
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return []
+
+        parsed = []
+        for disk in payload:
+            if not isinstance(disk, dict):
+                continue
+
+            size_label, size_bytes = _safe_round_gb(disk.get('Size'))
+            model = str(disk.get('Model') or disk.get('FriendlyName') or '').strip()
+            media_type = str(disk.get('MediaType') or '').strip()
+            bus_type = str(disk.get('BusType') or '').strip()
+            serial = str(disk.get('SerialNumber') or '').strip()
+
+            if size_bytes <= 0:
+                continue
+            if _is_virtual_disk(model, size_bytes, bus_type, media_type):
+                continue
+
+            disk_type = _infer_disk_type(media_type, model, bus_type)
+            if disk_type == 'No detectado' and 'HDD' in media_type.upper():
+                disk_type = 'HDD'
+
+            brand = _derive_brand_from_model(model)
+
+            parsed.append({
+                'size_bytes': size_bytes,
+                'capacidad': size_label,
+                'tipo': disk_type,
+                'serial': serial if serial else 'No detectado',
+                'marca': brand,
+                'modelo': model if model else 'No detectado'
+            })
+
+        parsed.sort(key=lambda item: item['size_bytes'], reverse=True)
+        return parsed
+
+    def _detect_hardware_cim_fallback():
+        fallback = {
+            'marca': 'No detectado',
+            'modelo': 'No detectado',
+            'serial': 'No detectado',
+            'disco1_capacidad': 'No detectado',
+            'disco1_tipo': 'No detectado',
+            'disco1_serial': 'No detectado',
+            'disco1_marca': 'No detectado',
+            'disco1_modelo': 'No detectado',
+            'disco2_capacidad': 'No tiene',
+            'disco2_tipo': 'No tiene',
+            'disco2_serial': 'No tiene',
+            'disco2_marca': 'No tiene',
+            'disco2_modelo': 'No tiene'
+        }
+
+        cmd = (
+            "$cs=Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue;"
+            "$bios=Get-CimInstance Win32_BIOS -ErrorAction SilentlyContinue;"
+            "$disks=Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue | Sort-Object Index | "
+            "Select-Object Index,Model,SerialNumber,Size,MediaType,InterfaceType,Manufacturer;"
+            "[pscustomobject]@{"
+            "marca=$cs.Manufacturer;"
+            "modelo=$cs.Model;"
+            "serial=$bios.SerialNumber;"
+            "discos=$disks"
+            "}|ConvertTo-Json -Compress -Depth 5"
+        )
+
+        output = _run_powershell(cmd, timeout=10)
+        if not output:
+            return fallback
+
+        try:
+            payload = json.loads(output)
+        except Exception:
+            return fallback
+
+        marca = str(payload.get('marca') or '').strip()
+        modelo = str(payload.get('modelo') or '').strip()
+        serial = str(payload.get('serial') or '').strip()
+
+        if marca:
+            fallback['marca'] = marca
+        if modelo:
+            fallback['modelo'] = modelo
+        if serial and not _is_placeholder(serial):
+            fallback['serial'] = serial
+
+        disks = payload.get('discos', [])
+        if isinstance(disks, dict):
+            disks = [disks]
+        if not isinstance(disks, list):
+            disks = []
+
+        physical_disks = []
+        for disk in disks:
+            if not isinstance(disk, dict):
+                continue
+            size_label, size_bytes = _safe_round_gb(disk.get('Size'))
+            if _is_virtual_disk(disk.get('Model'), size_bytes, disk.get('InterfaceType'), disk.get('MediaType')):
+                continue
+            physical_disks.append((disk, size_label))
+
+        if len(physical_disks) > 0:
+            disk1, size_label = physical_disks[0]
+            fallback['disco1_capacidad'] = size_label
+            fallback['disco1_tipo'] = _infer_disk_type(disk1.get('MediaType'), disk1.get('Model'), disk1.get('InterfaceType'))
+            serial_disk1 = str(disk1.get('SerialNumber') or '').strip()
+            fallback['disco1_serial'] = serial_disk1 if serial_disk1 else 'No detectado'
+            fallback['disco1_marca'] = _clean_disk_brand(disk1.get('Manufacturer'))
+            model_disk1 = str(disk1.get('Model') or '').strip()
+            fallback['disco1_modelo'] = model_disk1 if model_disk1 else 'No detectado'
+
+        if len(physical_disks) > 1:
+            disk2, size_label = physical_disks[1]
+            fallback['disco2_capacidad'] = size_label
+            fallback['disco2_tipo'] = _infer_disk_type(disk2.get('MediaType'), disk2.get('Model'), disk2.get('InterfaceType'))
+            serial_disk2 = str(disk2.get('SerialNumber') or '').strip()
+            fallback['disco2_serial'] = serial_disk2 if serial_disk2 else 'No detectado'
+            fallback['disco2_marca'] = _clean_disk_brand(disk2.get('Manufacturer'))
+            model_disk2 = str(disk2.get('Model') or '').strip()
+            fallback['disco2_modelo'] = model_disk2 if model_disk2 else 'No detectado'
+
+        return fallback
+
+    def _merge_missing_fields(primary, secondary):
+        for key, value in secondary.items():
+            if _is_placeholder(primary.get(key)) and not _is_placeholder(value):
+                primary[key] = value
+        return primary
+
+    def _apply_storage_disks(target, storage_disks):
+        if len(storage_disks) > 0:
+            d1 = storage_disks[0]
+            target['disco1_capacidad'] = d1['capacidad']
+            target['disco1_tipo'] = d1['tipo']
+            target['disco1_serial'] = d1['serial']
+            target['disco1_marca'] = d1['marca']
+            target['disco1_modelo'] = d1['modelo']
+
+        if len(storage_disks) > 1:
+            d2 = storage_disks[1]
+            target['disco2_capacidad'] = d2['capacidad']
+            target['disco2_tipo'] = d2['tipo']
+            target['disco2_serial'] = d2['serial']
+            target['disco2_marca'] = d2['marca']
+            target['disco2_modelo'] = d2['modelo']
+        else:
+            target['disco2_capacidad'] = 'No tiene'
+            target['disco2_tipo'] = 'No tiene'
+            target['disco2_serial'] = 'No tiene'
+            target['disco2_marca'] = 'No tiene'
+            target['disco2_modelo'] = 'No tiene'
+
+        return target
+
     if not HAS_WMI:
-        return info
-    
+        return _detect_hardware_cim_fallback()
+
     try:
-        # Inicializar COM
         try:
             import pythoncom
             pythoncom.CoInitialize()
-        except:
+        except Exception:
             pass
-        
+
         c = wmi.WMI()
-        
-        # ===== INFORMACIÓN DEL SISTEMA =====
+
         for system in c.Win32_ComputerSystem():
             info['marca'] = system.Manufacturer or 'No detectado'
             info['modelo'] = system.Model or 'No detectado'
-        
-        # ===== SERIAL DEL EQUIPO =====
+
         serial_found = False
-        serials_invalidos = ['default string', 'to be filled by o.e.m.', 
-                            'system serial number', 'base board serial number', 
+        serials_invalidos = ['default string', 'to be filled by o.e.m.',
+                            'system serial number', 'base board serial number',
                             'chassis serial number', '']
-        
-        # Intentar BIOS primero
-        for bios in c.Win32_BIOS():
-            serial = (bios.SerialNumber or '').strip()
-            if serial and serial.lower() not in serials_invalidos:
-                info['serial'] = serial
-                serial_found = True
-                break
-        
-        # Intentar BaseBoard
+
+        try:
+            wmic_result = subprocess.run(
+                ['wmic', 'bios', 'get', 'serialnumber'],
+                capture_output=True,
+                text=True,
+                timeout=4
+            )
+            wmic_lines = [line.strip() for line in (wmic_result.stdout or '').splitlines() if line.strip()]
+            if len(wmic_lines) >= 2:
+                serial_wmic = wmic_lines[1].strip()
+                if serial_wmic and serial_wmic.lower() not in serials_invalidos:
+                    info['serial'] = serial_wmic
+                    serial_found = True
+        except Exception:
+            pass
+
+        if not serial_found:
+            for bios in c.Win32_BIOS():
+                serial = (bios.SerialNumber or '').strip()
+                if serial and serial.lower() not in serials_invalidos:
+                    info['serial'] = serial
+                    serial_found = True
+                    break
+
         if not serial_found:
             for board in c.Win32_BaseBoard():
                 serial = (board.SerialNumber or '').strip()
@@ -196,8 +459,7 @@ def detect_hardware_wmi():
                     info['serial'] = f"MB-{serial}"
                     serial_found = True
                     break
-        
-        # Intentar ComputerSystemProduct
+
         if not serial_found:
             for product in c.Win32_ComputerSystemProduct():
                 serial = (product.IdentifyingNumber or '').strip()
@@ -205,79 +467,68 @@ def detect_hardware_wmi():
                     info['serial'] = serial
                     serial_found = True
                     break
-        
+
         if not serial_found:
             info['serial'] = "No detectado (PC genérico/armado)"
-        
-        # ===== DISCOS FÍSICOS =====
+
         disks = list(c.Win32_DiskDrive())
-        
-        # DISCO 1 (PRIMARIO)
-        if len(disks) > 0:
-            disk1 = disks[0]
-            
-            # Capacidad en GB
+        physical_disks = []
+        for disk in disks:
+            _, size_bytes = _safe_round_gb(getattr(disk, 'Size', 0))
+            if _is_virtual_disk(getattr(disk, 'Model', ''), size_bytes, getattr(disk, 'InterfaceType', ''), getattr(disk, 'MediaType', '')):
+                continue
+            physical_disks.append(disk)
+
+        if len(physical_disks) > 0:
+            disk1 = physical_disks[0]
+
             try:
-                size_bytes = int(disk1.Size) if disk1.Size else 0
-                size_gb = round(size_bytes / (1024**3))
-                info['disco1_capacidad'] = str(size_gb) 
-            except:
+                size_gb, _ = _safe_round_gb(disk1.Size)
+                info['disco1_capacidad'] = size_gb
+            except Exception:
                 info['disco1_capacidad'] = 'No detectado'
-            
-            # Tipo (SSD o HDD)
-            media_type = disk1.MediaType or ''
-            if 'SSD' in media_type.upper() or 'Solid State' in media_type:
-                info['disco1_tipo'] = 'SSD'
-            else:
-                info['disco1_tipo'] = 'HDD'  
-            
-            # Serial
+
+            info['disco1_tipo'] = _infer_disk_type(disk1.MediaType, getattr(disk1, 'Model', ''), getattr(disk1, 'InterfaceType', ''))
+
             serial_disk = (disk1.SerialNumber or '').strip()
             info['disco1_serial'] = serial_disk if serial_disk else 'No detectado'
-            
-            # Marca
+
             marca_disk = (disk1.Manufacturer or '').strip()
-            if marca_disk and marca_disk.lower() not in ['(standard disk drives)', '']:
-                info['disco1_marca'] = marca_disk
-            else:
-                info['disco1_marca'] = 'No detectado'
-            
-            # Modelo
+            info['disco1_marca'] = _clean_disk_brand(marca_disk)
+
             modelo_disk = (disk1.Model or '').strip()
             info['disco1_modelo'] = modelo_disk if modelo_disk else 'No detectado'
-        
-        # DISCO 2 (SECUNDARIO)
-        if len(disks) > 1:
-            disk2 = disks[1]
-            
+
+        if len(physical_disks) > 1:
+            disk2 = physical_disks[1]
+
             try:
-                size_bytes = int(disk2.Size) if disk2.Size else 0
-                size_gb = round(size_bytes / (1024**3))
-                info['disco2_capacidad'] = str(size_gb)
-            except:
+                size_gb, _ = _safe_round_gb(disk2.Size)
+                info['disco2_capacidad'] = size_gb
+            except Exception:
                 info['disco2_capacidad'] = 'Detectado'
-            
-            media_type = disk2.MediaType or ''
-            if 'SSD' in media_type.upper() or 'Solid State' in media_type:
-                info['disco2_tipo'] = 'SSD'
-            else:
-                info['disco2_tipo'] = 'HDD'
-            
+
+            info['disco2_tipo'] = _infer_disk_type(disk2.MediaType, getattr(disk2, 'Model', ''), getattr(disk2, 'InterfaceType', ''))
+
             serial_disk2 = (disk2.SerialNumber or '').strip()
             info['disco2_serial'] = serial_disk2 if serial_disk2 else 'No detectado'
-            
+
             marca_disk2 = (disk2.Manufacturer or '').strip()
-            if marca_disk2 and marca_disk2.lower() not in ['(standard disk drives)', '']:
-                info['disco2_marca'] = marca_disk2
-            else:
-                info['disco2_marca'] = 'No detectado'
-            
+            info['disco2_marca'] = _clean_disk_brand(marca_disk2)
+
             modelo_disk2 = (disk2.Model or '').strip()
             info['disco2_modelo'] = modelo_disk2 if modelo_disk2 else 'No detectado'
-    
+
     except Exception as e:
         print(f"Error WMI: {e}")
-    
+
+    cim_fallback = _detect_hardware_cim_fallback()
+    info = _merge_missing_fields(info, cim_fallback)
+
+    storage_disks = _detect_storage_api_disks()
+    if storage_disks:
+        info = _apply_storage_disks(info, storage_disks)
+
     return info
 
 
@@ -449,7 +700,7 @@ def detect_windows_license():
             ['cscript', '//nologo', r'C:\Windows\System32\slmgr.vbs', '/dli'],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=6
         )
         
         output = result.stdout
@@ -475,7 +726,7 @@ def detect_windows_license():
             ['cscript', '//nologo', r'C:\Windows\System32\slmgr.vbs', '/dli'],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=6
         )
         
         key_output = key_result.stdout
@@ -492,9 +743,121 @@ def detect_windows_license():
     return licencia_info
 
 
+def _run_powershell(command, timeout=8):
+    """Ejecutar comando de PowerShell y devolver salida limpia."""
+    try:
+        result = subprocess.run(
+            ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        output = (result.stdout or '').strip()
+        return output if output else None
+    except Exception:
+        return None
+
+
+def detect_tpm_status():
+    """Detectar estado de TPM."""
+    output = _run_powershell(
+        "$t=Get-Tpm -ErrorAction SilentlyContinue;"
+        "if($null -eq $t){'No detectado'}"
+        "elseif(-not $t.TpmPresent){'No presente'}"
+        "elseif($t.TpmReady){'Presente y listo'}"
+        "else{'Presente (no listo)'}",
+        timeout=6
+    )
+    return output or "No detectado"
+
+
+def detect_bitlocker_status():
+    """Detectar estado de BitLocker en unidad del sistema."""
+    output = _run_powershell(
+        "$v=Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue;"
+        "if($null -eq $v){'No disponible'}"
+        "elseif($v.ProtectionStatus -eq 'On' -or $v.ProtectionStatus -eq 1){"
+        "'Activo (' + $v.EncryptionPercentage + '%)'}"
+        "else{'Inactivo'}",
+        timeout=6
+    )
+
+    if output:
+        return output
+
+    fallback = _run_powershell(
+        "manage-bde -status $env:SystemDrive | Select-String 'Protection Status|Estado de protección' | ForEach-Object { $_.Line }",
+        timeout=6
+    )
+    if fallback:
+        text = fallback.lower()
+        if 'on' in text or 'activado' in text:
+            return 'Activo'
+        if 'off' in text or 'desactivado' in text:
+            return 'Inactivo'
+    return "No detectado"
+
+
+def detect_defender_status():
+    """Detectar estado real de Microsoft Defender."""
+    output = _run_powershell(
+        "$d=Get-MpComputerStatus -ErrorAction SilentlyContinue;"
+        "if($null -eq $d){'No detectado'}"
+        "elseif($d.AntivirusEnabled -and $d.RealTimeProtectionEnabled -and -not $d.DefenderSignaturesOutOfDate){'Activo'}"
+        "elseif($d.AntivirusEnabled -and $d.RealTimeProtectionEnabled){'Activo (firmas desactualizadas)'}"
+        "elseif($d.AntivirusEnabled){'Parcial'}"
+        "else{'Desactivado'}",
+        timeout=6
+    )
+    return output or "No detectado"
+
+
+def detect_cpu_cores():
+    """Detectar núcleos físicos de CPU."""
+    try:
+        if HAS_PSUTIL:
+            cores = psutil.cpu_count(logical=False)
+            if cores:
+                return str(cores)
+    except Exception:
+        pass
+
+    if HAS_WMI:
+        try:
+            c = wmi.WMI()
+            for cpu in c.Win32_Processor():
+                cores = getattr(cpu, 'NumberOfCores', None)
+                if cores:
+                    return str(cores)
+        except Exception:
+            pass
+
+    return "No detectado"
+
+
+def detect_current_cpu_ram_usage():
+    """Detectar uso actual de CPU y RAM (%)."""
+    if not HAS_PSUTIL:
+        return "No detectado", "No detectado"
+
+    try:
+        cpu_percent = psutil.cpu_percent(interval=0.7)
+        ram_percent = psutil.virtual_memory().percent
+        return f"{cpu_percent:.1f}%", f"{ram_percent:.1f}%"
+    except Exception:
+        return "No detectado", "No detectado"
+
+
 def detect_last_windows_update():
     """Detectar última actualización de Windows."""
     try:
+        hotfix = _run_powershell(
+            "Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1 HotFixID, InstalledOn | ForEach-Object { $_.HotFixID + ' - ' + $_.InstalledOn.ToString('yyyy-MM-dd') }",
+            timeout=6
+        )
+        if hotfix:
+            return hotfix
+
         if not HAS_WINREG:
             return "No detectado"
         
@@ -516,6 +879,143 @@ def detect_last_windows_update():
     
     except Exception as e:
         return "No detectado"
+
+
+def detect_switch_and_vlan():
+    """Detectar switch/puerto (si LLDP está disponible) y VLAN de la interfaz principal."""
+    try:
+        cmd = r"""
+        $adaptersUp = Get-NetAdapter -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Status -eq 'Up' -and $_.HardwareInterface -eq $true -and
+                $_.InterfaceDescription -notmatch 'Virtual|Hyper-V|VMware|Bluetooth|Loopback|Teredo|VPN|Pseudo'
+            }
+
+        $ethernet = $adaptersUp |
+            Where-Object {
+                $_.Name -match 'Ethernet|LAN' -or
+                $_.InterfaceDescription -match 'Ethernet|Gigabit|Realtek|Intel\(R\).*Ethernet|Killer E\d+'
+            } |
+            Select-Object -First 1
+
+        $adapter = $ethernet
+
+        if (-not $adapter) {
+            $ifIndex = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                        Sort-Object { $_.RouteMetric + $_.InterfaceMetric } |
+                        Select-Object -First 1 -ExpandProperty ifIndex)
+
+            if ($ifIndex) {
+                $adapter = $adaptersUp | Where-Object { $_.ifIndex -eq $ifIndex } | Select-Object -First 1
+            }
+        }
+
+        if (-not $adapter) {
+            $adapter = $adaptersUp | Select-Object -First 1
+        }
+
+        if (-not $adapter) {
+            [pscustomobject]@{ switch_puerto = 'No detectado'; vlan = 'No detectado' } | ConvertTo-Json -Compress
+            return
+        }
+
+        $vlan = 'No detectado'
+        $advProps = Get-NetAdapterAdvancedProperty -Name $adapter.Name -AllProperties -ErrorAction SilentlyContinue
+
+        # 1) Prioridad: buscar propiedad explícita de VLAN ID
+        $vlanIdProp = $advProps |
+            Where-Object { $_.DisplayName -match 'VLAN\s*ID|VLAN.*Identifier|ID de VLAN' -or $_.RegistryKeyword -match 'VlanId|VLANID|RegVlanid' } |
+            Select-Object -First 1
+
+        if ($vlanIdProp) {
+            $vlanCandidates = @()
+            if ($vlanIdProp.DisplayValue) { $vlanCandidates += $vlanIdProp.DisplayValue.ToString().Trim() }
+            if ($vlanIdProp.RegistryValue) { $vlanCandidates += ($vlanIdProp.RegistryValue -join ' ').Trim() }
+
+            foreach ($candidate in $vlanCandidates) {
+                if ($candidate -match '^\d{1,4}$') {
+                    $vlan = $candidate
+                    break
+                }
+                if ($candidate -match '(\d{1,4})') {
+                    $vlan = $matches[1]
+                    break
+                }
+            }
+        }
+
+        # 2) Fallback: estado de VLAN habilitada/deshabilitada
+        if ($vlan -eq 'No detectado') {
+            $vlanStateProp = $advProps |
+                Where-Object {
+                    $_.DisplayName -match 'Priority\s*&\s*VLAN|VLAN' -or
+                    $_.RegistryKeyword -match 'PriorityVlanTag|VLAN|Vlan'
+                } |
+                Select-Object -First 1
+
+            if ($vlanStateProp -and $vlanStateProp.DisplayValue) {
+                $v = $vlanStateProp.DisplayValue.ToString().Trim()
+                if ($v -and $v -notmatch 'Disabled|Deshabilitado|Not Present|No\s*VLAN') {
+                    $vlan = $v
+                }
+            }
+        }
+
+        $switchPuerto = 'No detectado'
+
+        if (Get-Command Get-NetLldpAgent -ErrorAction SilentlyContinue) {
+            $lldp = Get-NetLldpAgent -Name $adapter.Name -ErrorAction SilentlyContinue
+            if ($lldp) {
+                $bridge = $null
+                $port = $null
+
+                foreach ($prop in @('NearestBridge', 'NearestBridgeChassisId', 'NearestCustomerBridge')) {
+                    if ($lldp.PSObject.Properties.Name -contains $prop) {
+                        $val = $lldp.$prop
+                        if ($val) { $bridge = $val; break }
+                    }
+                }
+
+                foreach ($prop in @('NearestBridgePortId', 'NearestBridgePortDescription')) {
+                    if ($lldp.PSObject.Properties.Name -contains $prop) {
+                        $val = $lldp.$prop
+                        if ($val) { $port = $val; break }
+                    }
+                }
+
+                if ($bridge -and $port) {
+                    $switchPuerto = "$bridge / $port"
+                } elseif ($bridge) {
+                    $switchPuerto = "$bridge"
+                }
+            }
+        }
+
+        if ($switchPuerto -eq 'No detectado') {
+            $switchPuerto = "Adaptador: $($adapter.Name)"
+        }
+
+        if ($vlan -eq 'No detectado' -and ($adapter.Name -match 'Wi-?Fi|WLAN' -or $adapter.InterfaceDescription -match 'Wireless|Wi-?Fi|802\.11')) {
+            $vlan = 'N/A (Wi-Fi)'
+        }
+
+        [pscustomobject]@{
+            switch_puerto = $switchPuerto
+            vlan = $vlan
+        } | ConvertTo-Json -Compress
+        """
+
+        output = _run_powershell(cmd, timeout=10)
+        if not output:
+            return "No detectado", "No detectado"
+
+        data = json.loads(output)
+        switch_puerto = str(data.get("switch_puerto", "No detectado") or "No detectado").strip()
+        vlan = str(data.get("vlan", "No detectado") or "No detectado").strip()
+        return switch_puerto, vlan
+
+    except Exception:
+        return "No detectado", "No detectado"
     
 def detect_mac_address():
     """Detectar dirección MAC de la interfaz de red principal."""
@@ -585,7 +1085,7 @@ def detect_network_drives():
             ['net', 'use'],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=4
         )
         
         output = result.stdout
@@ -627,6 +1127,335 @@ def detect_ip_local():
             return local_ip
         except:
             return "No detectado"
+
+
+def detect_hostname_local():
+    """Detectar nombre del equipo local."""
+    try:
+        hostname = socket.gethostname()
+        if hostname and hostname.strip():
+            return hostname.strip()
+        return "No detectado"
+    except:
+        return "No detectado"
+
+
+def extract_json_object(text):
+    """Extraer primer objeto JSON válido desde un texto."""
+    if not text:
+        return None
+
+    text = text.strip()
+
+    try:
+        parsed_direct = json.loads(text)
+        if isinstance(parsed_direct, dict):
+            return parsed_direct
+    except Exception:
+        pass
+
+    block_match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
+    if block_match:
+        candidate = block_match.group(1).strip()
+        try:
+            parsed_block = json.loads(candidate)
+            if isinstance(parsed_block, dict):
+                return parsed_block
+        except Exception:
+            pass
+
+    brace_match = re.search(r"\{[\s\S]*\}", text)
+    if brace_match:
+        candidate = brace_match.group(0).strip()
+        try:
+            parsed_brace = json.loads(candidate)
+            if isinstance(parsed_brace, dict):
+                return parsed_brace
+        except Exception:
+            return None
+
+    return None
+
+
+def call_ollama_inventory_assistant(form_data, model_name="llama3.2:3b", timeout_sec=45):
+    """Consultar Ollama local para sugerencias de inventario."""
+    prompt = (
+        "Eres asistente técnico de inventario hospitalario. "
+        "Analiza el formulario y responde SOLO JSON válido con este esquema exacto: "
+        "{\"campos_faltantes\":[],\"inconsistencias\":[],\"recomendaciones\":[],"
+        "\"observaciones_tecnicas_sugeridas\":\"\",\"estado_operativo_sugerido\":\"\"}. "
+        "No uses markdown ni texto adicional. "
+        "Si no hay hallazgos, devuelve arreglos vacíos. "
+        "Los campos del formulario son:\n"
+        f"{json.dumps(form_data, ensure_ascii=False, indent=2)}"
+    )
+
+    payload = {
+        "model": model_name,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2
+        }
+    }
+
+    request = urllib.request.Request(
+        "http://127.0.0.1:11434/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        body = response.read().decode("utf-8", errors="replace")
+
+    response_json = json.loads(body)
+    raw_model_text = (response_json.get("response") or "").strip()
+
+    parsed_result = extract_json_object(raw_model_text)
+    if not parsed_result:
+        raise ValueError("La respuesta del modelo no vino en JSON válido")
+
+    parsed_result.setdefault("campos_faltantes", [])
+    parsed_result.setdefault("inconsistencias", [])
+    parsed_result.setdefault("recomendaciones", [])
+    parsed_result.setdefault("observaciones_tecnicas_sugeridas", "")
+    parsed_result.setdefault("estado_operativo_sugerido", "")
+
+    return parsed_result
+
+
+def detect_best_ollama_model(preferred_model=None):
+    """Elegir el mejor modelo disponible en Ollama local."""
+    candidates = []
+    if preferred_model:
+        candidates.append(preferred_model)
+
+    candidates.extend([
+        "llama3.1:8b",
+        "llama3.2:3b",
+        "llama3.2:1b",
+        "mistral:7b"
+    ])
+
+    request = urllib.request.Request(
+        "http://127.0.0.1:11434/api/tags",
+        method="GET"
+    )
+
+    with urllib.request.urlopen(request, timeout=8) as response:
+        body = response.read().decode("utf-8", errors="replace")
+
+    data = json.loads(body)
+    installed = [model.get("name", "") for model in data.get("models", []) if model.get("name")]
+
+    if not installed:
+        return preferred_model or "llama3.2:3b"
+
+    for candidate in candidates:
+        if candidate in installed:
+            return candidate
+
+    return installed[0]
+
+
+def get_ollama_executable_path():
+    """Obtener ruta del ejecutable de Ollama en Windows."""
+    by_path = shutil.which("ollama")
+    if by_path and os.path.exists(by_path):
+        return by_path
+
+    local_candidate = os.path.join(
+        os.environ.get("LOCALAPPDATA", ""),
+        "Programs",
+        "Ollama",
+        "ollama.exe"
+    )
+
+    if os.path.exists(local_candidate):
+        return local_candidate
+
+    return None
+
+
+def is_ollama_api_ready(timeout_sec=3):
+    """Verificar si la API local de Ollama responde."""
+    try:
+        request = urllib.request.Request("http://127.0.0.1:11434/api/tags", method="GET")
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            body = response.read().decode("utf-8", errors="replace")
+        data = json.loads(body)
+        return isinstance(data, dict) and "models" in data
+    except Exception:
+        return False
+
+
+def get_installed_ollama_models():
+    """Retornar nombres de modelos instalados en Ollama local."""
+    request = urllib.request.Request("http://127.0.0.1:11434/api/tags", method="GET")
+    with urllib.request.urlopen(request, timeout=8) as response:
+        body = response.read().decode("utf-8", errors="replace")
+
+    data = json.loads(body)
+    return [model.get("name", "") for model in data.get("models", []) if model.get("name")]
+
+
+def normalize_text_for_compare(value):
+    """Normalizar texto para comparación flexible."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+
+    normalized = unicodedata.normalize("NFD", raw)
+    normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def normalize_alnum(value):
+    """Normalizar valor alfanumérico (útil para serial/MAC)."""
+    return re.sub(r"[^a-zA-Z0-9]", "", str(value or "")).lower()
+
+
+def extract_first_number(value):
+    """Extraer primer número de un texto."""
+    match = re.search(r"\d+(?:[\.,]\d+)?", str(value or ""))
+    if not match:
+        return ""
+    return match.group(0).replace(",", ".")
+
+
+def read_docx_text(docx_path):
+    """Leer texto plano de un archivo .docx (párrafos y tablas)."""
+    if not docx_path.lower().endswith(".docx"):
+        raise ValueError("Solo se admite formato .docx")
+
+    with zipfile.ZipFile(docx_path, "r") as docx_zip:
+        with docx_zip.open("word/document.xml") as xml_file:
+            xml_content = xml_file.read()
+
+    root = ET.fromstring(xml_content)
+    namespaces = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+    lines = []
+    for paragraph in root.findall(".//w:p", namespaces):
+        text_parts = []
+        for node in paragraph.findall(".//w:t", namespaces):
+            if node.text:
+                text_parts.append(node.text)
+
+        paragraph_text = " ".join(text_parts).strip()
+        if paragraph_text:
+            lines.append(paragraph_text)
+
+    full_text = "\n".join(lines)
+    return full_text, lines
+
+
+def extract_value_from_doc(full_text, lines, regex_patterns, line_labels=None):
+    """Extraer un valor desde texto de hoja de vida usando regex y fallback por líneas."""
+    for pattern in regex_patterns:
+        match = re.search(pattern, full_text, flags=re.IGNORECASE | re.MULTILINE)
+        if match:
+            value = (match.group(1) or "").strip()
+            if value:
+                return value
+
+    if line_labels:
+        normalized_labels = [normalize_text_for_compare(label) for label in line_labels]
+        for idx, line in enumerate(lines):
+            normalized_line = normalize_text_for_compare(line)
+            if normalized_line in normalized_labels:
+                if idx + 1 < len(lines):
+                    candidate = (lines[idx + 1] or "").strip()
+                    if candidate:
+                        return candidate
+
+    return ""
+
+
+def extract_value_by_label(lines, labels):
+    """Extraer valor por etiqueta en la misma línea o en la línea siguiente (útil para tablas)."""
+    if not lines:
+        return ""
+
+    normalized_labels = [normalize_text_for_compare(label) for label in labels]
+
+    for idx, raw_line in enumerate(lines):
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+
+        normalized_line = normalize_text_for_compare(line)
+
+        for normalized_label in normalized_labels:
+            if not normalized_label:
+                continue
+
+            if normalized_line.startswith(normalized_label):
+                same_line_value = ""
+                if ":" in line:
+                    same_line_value = (line.split(":", 1)[1] or "").strip()
+                elif "-" in line:
+                    same_line_value = (line.split("-", 1)[1] or "").strip()
+                else:
+                    remainder = normalized_line[len(normalized_label):].strip(" .:-")
+                    if remainder:
+                        same_line_value = remainder
+
+                if same_line_value:
+                    return same_line_value
+
+                if idx + 1 < len(lines):
+                    next_line = (lines[idx + 1] or "").strip()
+                    if next_line:
+                        next_normalized = normalize_text_for_compare(next_line)
+                        if next_normalized not in normalized_labels:
+                            return next_line
+
+    return ""
+
+
+def extract_cpu_component_fields(lines):
+    """Extraer Marca/Modelo/Serial desde tabla de componentes en fila CPU."""
+    if not lines:
+        return "", "", ""
+
+    normalized_lines = [normalize_text_for_compare(line) for line in lines]
+
+    for index, normalized in enumerate(normalized_lines):
+        if normalized != "cpu":
+            continue
+
+        context_start = max(0, index - 8)
+        context = normalized_lines[context_start:index]
+        has_headers = all(header in context for header in ["componente", "marca", "modelo", "serial"])
+        if not has_headers:
+            continue
+
+        marca = (lines[index + 1].strip() if index + 1 < len(lines) else "")
+        modelo = (lines[index + 2].strip() if index + 2 < len(lines) else "")
+        serial = (lines[index + 3].strip() if index + 3 < len(lines) else "")
+
+        forbidden = {
+            "", "marca", "modelo", "serial", "especif.", "cod. inv.",
+            "componente", "monitor", "teclado", "mouse"
+        }
+
+        marca_norm = normalize_text_for_compare(marca)
+        modelo_norm = normalize_text_for_compare(modelo)
+        serial_norm = normalize_text_for_compare(serial)
+
+        if marca_norm in forbidden:
+            marca = ""
+        if modelo_norm in forbidden:
+            modelo = ""
+        if serial_norm in forbidden:
+            serial = ""
+
+        return marca, modelo, serial
+
+    return "", "", ""
 
 
 # ============================================================================
@@ -729,11 +1558,67 @@ class InventoryManagerApp:
             label="Dar de Baja", 
             command=lambda: self.show_form_directo("Dados de Baja")
         )
+        menu_operaciones.add_command(
+            label="Comparar Hoja de Vida",
+            command=lambda: self.show_form_directo("Comparar Hoja de Vida")
+        )
+        menu_operaciones.add_separator()
+        menu_operaciones.add_command(
+            label="Inventario Rápido (Externo)",
+            command=self.launch_inventario_rapido
+        )
         
         # MENÚ AYUDA
         menu_ayuda = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Ayuda", menu=menu_ayuda)
         menu_ayuda.add_command(label="Guía de Formulario", command=self.show_classification_guide)
+
+    def launch_inventario_rapido(self):
+        """Lanzar proyecto externo Inventario Rápido como módulo integrado."""
+        try:
+            if getattr(sys, "frozen", False):
+                base_dir = Path(sys.executable).resolve().parent
+            else:
+                base_dir = Path(__file__).resolve().parent
+
+            search_roots = [base_dir, *list(base_dir.parents)[:4], Path(__file__).resolve().parent, Path(__file__).resolve().parent.parent]
+            candidate_dirs = []
+            for root in search_roots:
+                candidate = root / "Script"
+                if candidate not in candidate_dirs:
+                    candidate_dirs.append(candidate)
+
+            external_project_dir = next(
+                (candidate for candidate in candidate_dirs if (candidate / "main.py").exists()),
+                candidate_dirs[0]
+            )
+            external_main = external_project_dir / "main.py"
+
+            if not external_main.exists():
+                messagebox.showerror(
+                    "Proyecto no encontrado",
+                    "No se encontró el proyecto externo 'Inventario Rápido'.\n"
+                    f"Ruta intentada: {external_main}\n\n"
+                    "Coloca la carpeta 'Script' junto al .exe "
+                    "(o junto a la carpeta del proyecto en modo desarrollo)."
+                )
+                return
+
+            external_venv_python = external_project_dir / ".venv" / "Scripts" / "python.exe"
+            python_executable = str(external_venv_python) if external_venv_python.exists() else sys.executable
+
+            subprocess.Popen(
+                [python_executable, str(external_main)],
+                cwd=str(external_project_dir)
+            )
+
+            messagebox.showinfo(
+                "Módulo abierto",
+                "Inventario Rápido se abrió en una ventana separada."
+            )
+
+        except Exception as e:
+            messagebox.showerror("Error", f"No fue posible abrir Inventario Rápido:\n{e}")
     
     def show_form_directo(self, tipo):
         """Mostrar formulario directamente sin tabs."""
@@ -758,6 +1643,8 @@ class InventoryManagerApp:
             lambda: self.show_form_in_container(self.create_mantenimientos_form)()
         elif tipo == "Dados de Baja":
             lambda: self.show_form_in_container(self.create_baja_form)()
+        elif tipo == "Comparar Hoja de Vida":
+            lambda: self.show_form_in_container(self.create_hoja_vida_compare_form)()
     
     def show_manual_form_in_container(self):
         """Mostrar formulario manual:"""
@@ -812,6 +1699,9 @@ class InventoryManagerApp:
                                         "combobox", TIPOS_EQUIPO)
         self.create_form_field_centered(form_frame, "Área / Servicio", "area_servicio", 
                                         "combobox", AREAS_SERVICIO)
+        self.manual_widgets['area_servicio'].configure(
+            command=lambda choice: self.on_area_servicio_change(choice)
+        )
         self.create_form_field_centered(form_frame, "Ubicación Específica", "ubicacion_especifica", 
                                         "entry")
         self.create_form_field_centered(form_frame, "Responsable / Custodio", "responsable_custodio", 
@@ -1004,6 +1894,56 @@ class InventoryManagerApp:
         )
         btn_collect.pack(side="left", padx=8)
 
+        # Botón 4: ASISTENTE IA LOCAL (Ollama)
+        btn_ai_frame = ctk.CTkFrame(form_frame, fg_color="transparent")
+        btn_ai_frame.pack(pady=(0, 15))
+
+        btn_ai = ctk.CTkButton(
+            btn_ai_frame,
+            text="🤖 ASISTENTE IA (LOCAL)",
+            command=self.run_local_ai_assistant,
+            font=("Segoe UI", 13, "bold"),
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
+            height=BTN_HEIGHT,
+            width=BTN_WIDTH
+        )
+        btn_ai.pack()
+
+    def on_area_servicio_change(self, selected_area):
+        """Permitir capturar un área personalizada cuando se selecciona 'Otra Área / Servicio'."""
+        if selected_area != "Otra Área / Servicio":
+            return
+
+        area_widget = self.manual_widgets.get("area_servicio")
+        if not area_widget:
+            return
+
+        dialog = ctk.CTkInputDialog(
+            text="Escribe el nombre del área / servicio:",
+            title="Nueva Área / Servicio"
+        )
+        nueva_area = (dialog.get_input() or "").strip()
+
+        if not nueva_area:
+            messagebox.showwarning(
+                "Área / Servicio",
+                "Debes escribir un nombre de área para usar la opción personalizada."
+            )
+            area_widget.set("")
+            return
+
+        valores_actuales = list(area_widget.cget("values"))
+        if nueva_area not in valores_actuales:
+            if "Otra Área / Servicio" in valores_actuales:
+                posicion = valores_actuales.index("Otra Área / Servicio")
+                valores_actuales.insert(posicion, nueva_area)
+            else:
+                valores_actuales.append(nueva_area)
+            area_widget.configure(values=valores_actuales)
+
+        area_widget.set(nueva_area)
+
     def on_macroproceso_change(self, selected_macroproceso):
         """Actualizar lista de Procesos cuando cambia el Macroproceso."""
         # Limpiar proceso y subproceso
@@ -1036,6 +1976,299 @@ class InventoryManagerApp:
         
         # Actualizar lista de subprocesos
         self.manual_widgets["subproceso"].configure(values=subprocesos)
+
+    def get_manual_form_data_snapshot(self):
+        """Capturar estado actual de los campos del formulario manual."""
+        snapshot = {}
+        for field_name, widget in self.manual_widgets.items():
+            try:
+                if isinstance(widget, tk.StringVar):
+                    snapshot[field_name] = (widget.get() or "").strip()
+                elif hasattr(widget, 'winfo_exists') and widget.winfo_exists():
+                    if isinstance(widget, (ctk.CTkEntry, ctk.CTkComboBox)):
+                        snapshot[field_name] = (widget.get() or "").strip()
+            except Exception:
+                snapshot[field_name] = ""
+        return snapshot
+
+    def run_local_ai_assistant(self):
+        """Ejecutar asistente IA local (Ollama) para revisar formulario."""
+        if not self.manual_widgets:
+            messagebox.showwarning("Asistente IA", "No hay formulario activo para analizar.")
+            return
+
+        form_data = self.get_manual_form_data_snapshot()
+        preferred_model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+        self.ai_model_name = preferred_model
+
+        self.ai_wait_window = ctk.CTkToplevel(self.root)
+        self.ai_wait_window.title("Asistente IA Local")
+        self.ai_wait_window.geometry("430x180")
+        self.ai_wait_window.transient(self.root)
+        self.ai_wait_window.grab_set()
+
+        self.ai_wait_label = ctk.CTkLabel(
+            self.ai_wait_window,
+            text="Preparando IA local...",
+            font=("Segoe UI", 12, "bold")
+        )
+        self.ai_wait_label.pack(pady=(25, 10))
+
+        wait_info = ctk.CTkLabel(
+            self.ai_wait_window,
+            text="Si es el primer uso en este PC, puede tardar varios minutos.",
+            font=("Segoe UI", 11)
+        )
+        wait_info.pack(pady=(0, 10))
+
+        wait_bar = ctk.CTkProgressBar(self.ai_wait_window, mode="indeterminate", width=320)
+        wait_bar.pack(pady=10)
+        wait_bar.start()
+
+        def worker():
+            try:
+                selected_model = self.ensure_ollama_ready_for_ai(preferred_model)
+                self.ai_model_name = selected_model
+                self.update_ai_wait_status(f"Analizando con IA local ({self.ai_model_name})...")
+
+                result = call_ollama_inventory_assistant(
+                    form_data=form_data,
+                    model_name=self.ai_model_name,
+                    timeout_sec=45
+                )
+                self.root.after(0, lambda: self.show_ai_result_window(result))
+            except urllib.error.URLError:
+                self.root.after(0, self.show_ollama_connection_error)
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Asistente IA", f"Error consultando IA local:\n{e}"))
+            finally:
+                self.root.after(0, lambda: self.safe_close_ai_wait_window())
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+    def update_ai_wait_status(self, text):
+        """Actualizar texto de estado en la ventana de espera de IA."""
+        def _set_text():
+            try:
+                if hasattr(self, 'ai_wait_label') and self.ai_wait_label and self.ai_wait_label.winfo_exists():
+                    self.ai_wait_label.configure(text=text)
+            except Exception:
+                pass
+
+        self.root.after(0, _set_text)
+
+    def ensure_ollama_ready_for_ai(self, preferred_model):
+        """Garantizar Ollama + modelo en primer uso (instalación automática)."""
+        if is_ollama_api_ready(timeout_sec=3):
+            try:
+                return detect_best_ollama_model(preferred_model)
+            except Exception:
+                return preferred_model or "llama3.2:3b"
+
+        ollama_exe = get_ollama_executable_path()
+
+        if not ollama_exe:
+            self.update_ai_wait_status("Instalando Ollama automáticamente...")
+            winget_path = shutil.which("winget")
+
+            if not winget_path:
+                raise RuntimeError("No se encontró winget para instalación automática de Ollama.")
+
+            install_proc = subprocess.run(
+                [
+                    winget_path,
+                    "install",
+                    "--id",
+                    "Ollama.Ollama",
+                    "-e",
+                    "--accept-source-agreements",
+                    "--accept-package-agreements"
+                ],
+                capture_output=True,
+                text=True
+            )
+
+            if install_proc.returncode != 0:
+                raise RuntimeError("Falló instalación automática de Ollama con winget.")
+
+            ollama_exe = get_ollama_executable_path()
+            if not ollama_exe:
+                raise RuntimeError("Ollama se instaló, pero no se encontró el ejecutable.")
+
+        if not is_ollama_api_ready(timeout_sec=3):
+            self.update_ai_wait_status("Iniciando servicio Ollama...")
+
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen(
+                [ollama_exe, "serve"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags
+            )
+
+            started = False
+            for _ in range(30):
+                if is_ollama_api_ready(timeout_sec=2):
+                    started = True
+                    break
+                time.sleep(1)
+
+            if not started:
+                raise RuntimeError("No fue posible iniciar el servicio local de Ollama.")
+
+        installed_models = []
+        try:
+            installed_models = get_installed_ollama_models()
+        except Exception:
+            installed_models = []
+
+        target_model = preferred_model or "llama3.2:3b"
+
+        if target_model not in installed_models:
+            self.update_ai_wait_status(f"Descargando modelo {target_model}...")
+            pull_proc = subprocess.run([ollama_exe, "pull", target_model], capture_output=True, text=True)
+
+            if pull_proc.returncode != 0:
+                if not installed_models:
+                    fallback_model = "llama3.2:3b"
+                    self.update_ai_wait_status(f"Intentando modelo alterno {fallback_model}...")
+                    fallback_proc = subprocess.run([ollama_exe, "pull", fallback_model], capture_output=True, text=True)
+                    if fallback_proc.returncode != 0:
+                        raise RuntimeError("No se pudo descargar ningún modelo de IA local.")
+                    target_model = fallback_model
+
+        try:
+            return detect_best_ollama_model(target_model)
+        except Exception:
+            return target_model
+
+    def safe_close_ai_wait_window(self):
+        """Cerrar ventana de espera del asistente IA de forma segura."""
+        try:
+            if hasattr(self, 'ai_wait_window') and self.ai_wait_window and self.ai_wait_window.winfo_exists():
+                self.ai_wait_window.destroy()
+        except Exception:
+            pass
+
+    def show_ollama_connection_error(self):
+        """Mostrar instrucciones cuando Ollama local no está disponible."""
+        messagebox.showerror(
+            "Asistente IA - Sin conexión",
+            "No se pudo conectar con Ollama local (la app intentó configurarlo automáticamente).\n\n"
+            "Verifica en PowerShell:\n"
+            "1) ollama serve\n"
+            "2) ollama pull llama3.2:3b\n"
+            "3) (Opcional) setx OLLAMA_MODEL \"llama3.2:3b\""
+        )
+
+    def show_ai_result_window(self, ai_result):
+        """Mostrar resultados del asistente IA y permitir aplicar sugerencias."""
+        self.ai_last_result = ai_result
+
+        campos_faltantes = ai_result.get("campos_faltantes", [])
+        inconsistencias = ai_result.get("inconsistencias", [])
+        recomendaciones = ai_result.get("recomendaciones", [])
+        observaciones = (ai_result.get("observaciones_tecnicas_sugeridas") or "").strip()
+        estado_sugerido = (ai_result.get("estado_operativo_sugerido") or "").strip()
+
+        result_window = ctk.CTkToplevel(self.root)
+        result_window.title("Resultado Asistente IA")
+        result_window.geometry("760x520")
+        result_window.transient(self.root)
+        result_window.grab_set()
+
+        header = ctk.CTkLabel(
+            result_window,
+            text="🤖 Asistente IA Local - Resultado",
+            font=("Segoe UI", 16, "bold"),
+            text_color=COLOR_VERDE_HOSPITAL
+        )
+        header.pack(pady=(18, 10))
+
+        text_box = ctk.CTkTextbox(result_window, width=700, height=360, font=("Consolas", 11))
+        text_box.pack(padx=20, pady=10, fill="both", expand=True)
+
+        resumen = []
+        resumen.append("=== CAMPOS FALTANTES ===")
+        resumen.extend([f"- {item}" for item in campos_faltantes] or ["- Ninguno"])
+        resumen.append("\n=== INCONSISTENCIAS ===")
+        resumen.extend([f"- {item}" for item in inconsistencias] or ["- Ninguna"])
+        resumen.append("\n=== RECOMENDACIONES ===")
+        resumen.extend([f"- {item}" for item in recomendaciones] or ["- Ninguna"])
+        resumen.append("\n=== OBSERVACIONES TÉCNICAS SUGERIDAS ===")
+        resumen.append(observaciones or "Sin sugerencia")
+        resumen.append("\n=== ESTADO OPERATIVO SUGERIDO ===")
+        resumen.append(estado_sugerido or "Sin sugerencia")
+
+        text_box.insert("1.0", "\n".join(resumen))
+        text_box.configure(state="disabled")
+
+        btn_frame = ctk.CTkFrame(result_window, fg_color="transparent")
+        btn_frame.pack(pady=(8, 16))
+
+        btn_apply = ctk.CTkButton(
+            btn_frame,
+            text="✅ Aplicar sugerencias",
+            command=lambda: self.apply_ai_suggestions(result_window),
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
+            width=210,
+            height=40,
+            font=("Segoe UI", 12, "bold")
+        )
+        btn_apply.pack(side="left", padx=10)
+
+        btn_close = ctk.CTkButton(
+            btn_frame,
+            text="Cerrar",
+            command=result_window.destroy,
+            fg_color="#808080",
+            hover_color="#666666",
+            width=140,
+            height=40,
+            font=("Segoe UI", 12, "bold")
+        )
+        btn_close.pack(side="left", padx=10)
+
+    def apply_ai_suggestions(self, result_window):
+        """Aplicar sugerencias de IA a campos del formulario manual."""
+        if not hasattr(self, 'ai_last_result'):
+            return
+
+        ai_result = self.ai_last_result
+        applied = []
+
+        obs_sugerida = (ai_result.get("observaciones_tecnicas_sugeridas") or "").strip()
+        if obs_sugerida and 'observaciones_tecnicas' in self.manual_widgets:
+            widget = self.manual_widgets['observaciones_tecnicas']
+            if isinstance(widget, ctk.CTkEntry):
+                current = (widget.get() or "").strip()
+                if not current or messagebox.askyesno(
+                    "Asistente IA",
+                    "El campo 'Observaciones Técnicas' ya tiene texto.\n¿Deseas reemplazarlo con la sugerencia de IA?"
+                ):
+                    widget.delete(0, 'end')
+                    widget.insert(0, obs_sugerida)
+                    applied.append("Observaciones Técnicas")
+
+        estado_sugerido = (ai_result.get("estado_operativo_sugerido") or "").strip()
+        if estado_sugerido and 'estado_operativo' in self.manual_widgets:
+            widget = self.manual_widgets['estado_operativo']
+            if isinstance(widget, ctk.CTkComboBox):
+                widget.set(estado_sugerido)
+                applied.append("Estado Operativo")
+
+        if applied:
+            messagebox.showinfo("Asistente IA", f"Sugerencias aplicadas:\n- " + "\n- ".join(applied))
+        else:
+            messagebox.showinfo("Asistente IA", "No había sugerencias aplicables automáticamente.")
+
+        try:
+            if result_window and result_window.winfo_exists():
+                result_window.destroy()
+        except Exception:
+            pass
 
     def get_next_available_row(self, sheet_name, check_column=1, max_rows=500):
         """
@@ -1359,6 +2592,1012 @@ class InventoryManagerApp:
             self.show_form_in_container(self.create_mantenimientos_form)
         elif tipo == "Dados de Baja":
             self.show_form_in_container(self.create_baja_form)
+        elif tipo == "Comparar Hoja de Vida":
+            self.show_form_in_container(self.create_hoja_vida_compare_form)
+
+    def create_hoja_vida_compare_form(self, parent):
+        """Crear sección para comparar hoja de vida (.docx) contra registro en Excel."""
+        frame = ctk.CTkScrollableFrame(
+            parent,
+            fg_color=COLOR_FONDO,
+            corner_radius=0
+        )
+        frame.pack(fill="both", expand=True)
+
+        title_frame = ctk.CTkFrame(frame, fg_color=COLOR_VERDE_HOSPITAL, corner_radius=12)
+        title_frame.pack(fill="x", padx=20, pady=(20, 12))
+
+        ctk.CTkLabel(
+            title_frame,
+            text="📄 COMPARADOR HOJA DE VIDA VS EXCEL",
+            font=("Segoe UI", 17, "bold"),
+            text_color="white"
+        ).pack(pady=14)
+
+        help_text = (
+            "1) Selecciona la hoja de vida (.docx).\n"
+            "2) El sistema detecta automáticamente el código EQC-xxxx desde el documento.\n"
+            "3) Presiona COMPARAR para completar vacíos en Excel y cargar el equipo en inicio."
+        )
+        ctk.CTkLabel(
+            frame,
+            text=help_text,
+            justify="left",
+            font=("Segoe UI", 12)
+        ).pack(anchor="w", padx=25, pady=(5, 12))
+
+        top_controls = ctk.CTkFrame(frame, fg_color="transparent")
+        top_controls.pack(fill="x", padx=20)
+
+        self.hoja_vida_docx_path = getattr(self, "hoja_vida_docx_path", "")
+
+        def seleccionar_docx():
+            filename = filedialog.askopenfilename(
+                title="Seleccionar Hoja de Vida del Equipo",
+                filetypes=[("Word", "*.docx"), ("Todos los archivos", "*.*")]
+            )
+            if filename:
+                self.hoja_vida_docx_path = filename
+                self.hoja_vida_selected_label.configure(text=f"📄 {os.path.basename(filename)}")
+
+        btn_select = ctk.CTkButton(
+            top_controls,
+            text="📁 Seleccionar Hoja de Vida (.docx)",
+            command=seleccionar_docx,
+            font=("Segoe UI", 12, "bold"),
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
+            width=320,
+            height=42
+        )
+        btn_select.pack(side="left", padx=(0, 12), pady=(0, 10))
+
+        btn_preview_doc = ctk.CTkButton(
+            top_controls,
+            text="👁 Visualizar datos útiles",
+            command=self.on_preview_docx_data,
+            font=("Segoe UI", 12, "bold"),
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
+            width=230,
+            height=42
+        )
+        btn_preview_doc.pack(side="left", padx=(0, 12), pady=(0, 10))
+
+        self.hoja_vida_selected_label = ctk.CTkLabel(
+            top_controls,
+            text=(f"📄 {os.path.basename(self.hoja_vida_docx_path)}" if self.hoja_vida_docx_path else "📄 Ningún archivo seleccionado"),
+            font=("Segoe UI", 12)
+        )
+        self.hoja_vida_selected_label.pack(side="left", pady=(0, 10))
+
+        btn_compare = ctk.CTkButton(
+            frame,
+            text="🔎 COMPARAR CON EXCEL",
+            command=self.run_hoja_vida_excel_comparison,
+            font=("Segoe UI", 13, "bold"),
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
+            height=44,
+            width=280
+        )
+        btn_compare.pack(anchor="w", padx=20, pady=(6, 14))
+
+        self.compare_result_text = ctk.CTkTextbox(
+            frame,
+            width=1300,
+            height=520,
+            font=("Consolas", 11)
+        )
+        self.compare_result_text.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+
+        self.compare_result_text.insert(
+            "end",
+            "Resultado de comparación aparecerá aquí...\n"
+            "Tip: el sistema detecta automáticamente el código EQC-xxxx desde la hoja de vida."
+        )
+        self.compare_result_text.configure(state="disabled")
+
+    def set_compare_result(self, content):
+        """Actualizar caja de resultados del comparador."""
+        if not hasattr(self, "compare_result_text"):
+            return
+        self.compare_result_text.configure(state="normal")
+        self.compare_result_text.delete("1.0", "end")
+        self.compare_result_text.insert("end", content)
+        self.compare_result_text.configure(state="disabled")
+
+    def get_excel_equipo_by_codigo(self, codigo):
+        """Obtener campos principales de un equipo desde Excel por código."""
+        if not self.excel_path or not HAS_OPENPYXL:
+            return None
+
+        column_map = {
+            2: "codigo",
+            3: "nombre_equipo",
+            4: "tipo_equipo",
+            5: "area_servicio",
+            6: "ubicacion_especifica",
+            7: "responsable_custodio",
+            39: "marca",
+            40: "modelo",
+            41: "serial",
+            42: "sistema_operativo",
+            44: "procesador",
+            45: "ram_gb",
+            46: "disco1_capacidad",
+            64: "direccion_ip",
+            65: "mac_address",
+        }
+
+        wb = None
+        try:
+            wb = load_workbook(self.excel_path, read_only=True)
+            ws = wb["Equipos de Cómputo"]
+
+            target_row = None
+            for row in range(2, 5000):
+                value = ws.cell(row=row, column=2).value
+                if value and str(value).strip().upper() == codigo:
+                    target_row = row
+                    break
+
+            if not target_row:
+                return None
+
+            data = {}
+            for col, field in column_map.items():
+                value = ws.cell(row=target_row, column=col).value
+                data[field] = "" if value is None else str(value).strip()
+
+            data["__row"] = target_row
+
+            return data
+        finally:
+            if wb:
+                wb.close()
+
+    def fill_missing_excel_fields_from_doc(self, codigo, doc_data):
+        """Completar en Excel los campos vacíos usando datos extraídos de la hoja de vida."""
+        if not self.excel_path or not HAS_OPENPYXL:
+            return 0, []
+
+        field_to_column = {
+            "nombre_equipo": 3,
+            "tipo_equipo": 4,
+            "area_servicio": 5,
+            "ubicacion_especifica": 6,
+            "responsable_custodio": 7,
+            "marca": 39,
+            "modelo": 40,
+            "serial": 41,
+            "sistema_operativo": 42,
+            "procesador": 44,
+            "ram_gb": 45,
+            "disco1_capacidad": 46,
+            "direccion_ip": 64,
+            "mac_address": 65,
+        }
+
+        wb = None
+        updated_fields = []
+        try:
+            wb = load_workbook(self.excel_path)
+            ws = wb["Equipos de Cómputo"]
+
+            target_row = None
+            for row in range(2, 5000):
+                value = ws.cell(row=row, column=2).value
+                if value and str(value).strip().upper() == codigo:
+                    target_row = row
+                    break
+
+            if not target_row:
+                return 0, []
+
+            for field_name, col in field_to_column.items():
+                current_value = ws.cell(row=target_row, column=col).value
+                current_raw = str(current_value or "").strip()
+                doc_raw = str(doc_data.get(field_name, "") or "").strip()
+
+                if not current_raw and doc_raw:
+                    ws.cell(row=target_row, column=col, value=doc_raw)
+                    updated_fields.append(field_name)
+
+            if updated_fields:
+                wb.save(self.excel_path)
+
+            return len(updated_fields), updated_fields
+        finally:
+            if wb:
+                wb.close()
+
+    def create_new_equipo_from_doc_data(self, doc_data, forced_codigo=None):
+        """Crear nuevo equipo en Excel usando datos de hoja de vida y dejar faltantes para completar."""
+        if not self.excel_path or not HAS_OPENPYXL:
+            return None, 0
+
+        wb = None
+        try:
+            wb = load_workbook(self.excel_path)
+            ws = wb["Equipos de Cómputo"]
+
+            last_consecutive = 0
+            first_empty_row = 2
+            for row in range(2, 5000):
+                value = ws.cell(row=row, column=1).value
+                if value is not None:
+                    try:
+                        consecutive = int(value)
+                        if consecutive > last_consecutive:
+                            last_consecutive = consecutive
+                    except Exception:
+                        pass
+                else:
+                    first_empty_row = row
+                    break
+
+            next_consecutive = last_consecutive + 1
+            codigo = (forced_codigo or f"EQC-{next_consecutive:04d}").strip().upper()
+
+            # Si el código forzado ya existe, usar código automático para evitar duplicado
+            for row in range(2, 5000):
+                current_code = ws.cell(row=row, column=2).value
+                if current_code and str(current_code).strip().upper() == codigo:
+                    codigo = f"EQC-{next_consecutive:04d}"
+                    break
+
+            ws.cell(row=first_empty_row, column=1, value=next_consecutive)
+            ws.cell(row=first_empty_row, column=2, value=codigo)
+
+            field_to_column = {
+                "nombre_equipo": 3,
+                "tipo_equipo": 4,
+                "area_servicio": 5,
+                "ubicacion_especifica": 6,
+                "responsable_custodio": 7,
+                "marca": 39,
+                "modelo": 40,
+                "serial": 41,
+                "sistema_operativo": 42,
+                "procesador": 44,
+                "ram_gb": 45,
+                "disco1_capacidad": 46,
+                "direccion_ip": 64,
+                "mac_address": 65,
+            }
+
+            filled_count = 0
+            for field_name, col in field_to_column.items():
+                value = str(doc_data.get(field_name, "") or "").strip()
+                if value:
+                    ws.cell(row=first_empty_row, column=col, value=value)
+                    filled_count += 1
+
+            wb.save(self.excel_path)
+            return codigo, filled_count
+        finally:
+            if wb:
+                wb.close()
+
+    def get_doc_fill_field_meta(self):
+        """Metadatos de campos que se llenan desde hoja de vida."""
+        return [
+            ("nombre_equipo", "Nombre Equipo"),
+            ("tipo_equipo", "Tipo de Equipo"),
+            ("area_servicio", "Área / Servicio"),
+            ("ubicacion_especifica", "Ubicación Específica"),
+            ("responsable_custodio", "Responsable / Custodio"),
+            ("marca", "Marca"),
+            ("modelo", "Modelo"),
+            ("serial", "Serial"),
+            ("sistema_operativo", "Sistema Operativo"),
+            ("procesador", "Procesador"),
+            ("ram_gb", "RAM (GB)"),
+            ("disco1_capacidad", "Disco 1 Capacidad"),
+            ("direccion_ip", "Dirección IP"),
+            ("mac_address", "MAC Address"),
+        ]
+
+    def build_fill_preview_rows_existing(self, excel_data, doc_data):
+        """Construir filas a llenar para un equipo existente (solo vacíos)."""
+        rows = []
+        for field_key, field_label in self.get_doc_fill_field_meta():
+            excel_value = str(excel_data.get(field_key, "") or "").strip()
+            doc_value = str(doc_data.get(field_key, "") or "").strip()
+            if (not excel_value) and doc_value:
+                rows.append((field_label, "(vacío)", doc_value))
+        return rows
+
+    def build_fill_preview_rows_new(self, doc_data):
+        """Construir filas a llenar para un equipo nuevo."""
+        rows = []
+        for field_key, field_label in self.get_doc_fill_field_meta():
+            doc_value = str(doc_data.get(field_key, "") or "").strip()
+            if doc_value:
+                rows.append((field_label, "(nuevo)", doc_value))
+        return rows
+
+    def show_fill_preview_window(self, title, rows):
+        """Mostrar mini excel con campos que se llenarán y confirmar acción."""
+        if not rows:
+            return messagebox.askyesno(
+                title,
+                "No se detectaron campos nuevos para llenar en Excel.\n\n"
+                "¿Deseas continuar de todos modos?"
+            )
+
+        preview = ctk.CTkToplevel(self.root)
+        preview.title(title)
+        preview.geometry("900x430")
+        preview.transient(self.root)
+        preview.grab_set()
+
+        preview.update_idletasks()
+        x = (preview.winfo_screenwidth() // 2) - 450
+        y = (preview.winfo_screenheight() // 2) - 215
+        preview.geometry(f"900x430+{x}+{y}")
+
+        ctk.CTkLabel(
+            preview,
+            text="🧾 Vista previa (mini excel) de campos a llenar",
+            font=("Segoe UI", 15, "bold")
+        ).pack(pady=(14, 8))
+
+        container = ctk.CTkFrame(preview, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=16, pady=8)
+
+        cols = ("campo", "excel", "nuevo")
+        tree = ttk.Treeview(container, columns=cols, show="headings", height=12)
+        tree.heading("campo", text="Campo")
+        tree.heading("excel", text="Excel actual")
+        tree.heading("nuevo", text="Valor a llenar")
+        tree.column("campo", width=250, anchor="w")
+        tree.column("excel", width=180, anchor="w")
+        tree.column("nuevo", width=430, anchor="w")
+
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        for row in rows:
+            tree.insert("", "end", values=row)
+
+        decision = {"ok": False}
+
+        btns = ctk.CTkFrame(preview, fg_color="transparent")
+        btns.pack(fill="x", padx=16, pady=(6, 14))
+
+        def on_continue():
+            decision["ok"] = True
+            preview.destroy()
+
+        def on_cancel():
+            decision["ok"] = False
+            preview.destroy()
+
+        ctk.CTkButton(
+            btns,
+            text="✅ Continuar y llenar",
+            command=on_continue,
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
+            width=200
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            btns,
+            text="❌ Cancelar",
+            command=on_cancel,
+            fg_color="#6C757D",
+            hover_color="#5A6268",
+            width=140
+        ).pack(side="right")
+
+        preview.wait_window()
+        return decision["ok"]
+
+    def on_preview_docx_data(self):
+        """Mostrar vista previa manual de datos útiles dentro del panel actual."""
+        docx_path = (getattr(self, "hoja_vida_docx_path", "") or "").strip()
+        if not docx_path:
+            messagebox.showwarning("Vista previa", "Primero selecciona una hoja de vida (.docx).")
+            return
+
+        if not os.path.exists(docx_path):
+            messagebox.showerror("Vista previa", "El archivo seleccionado ya no existe.")
+            return
+
+        try:
+            full_text, lines = read_docx_text(docx_path)
+            doc_data = self.extract_hoja_vida_data(full_text, lines)
+
+            detected_codigo = ""
+            match_codigo = re.search(r"\bEQC-\d{4,5}\b", full_text, flags=re.IGNORECASE)
+            if match_codigo:
+                detected_codigo = match_codigo.group(0).upper()
+
+            codigo = detected_codigo or (doc_data.get("codigo", "") or "").strip().upper()
+
+            report = []
+            report.append("=" * 92)
+            report.append("VISTA PREVIA DESDE HOJA DE VIDA (.DOCX)")
+            report.append("=" * 92)
+            report.append(f"Archivo: {os.path.basename(docx_path)}")
+            report.append(f"Código detectado: {codigo if codigo else '(sin código)'}")
+            report.append("")
+            report.append("DATOS DETECTADOS")
+
+            for field_key, field_label in self.get_doc_fill_field_meta():
+                value = str(doc_data.get(field_key, "") or "").strip()
+                report.append(f"- {field_label}: {value if value else '(vacío/no detectado)'}")
+
+            report.append("")
+            report.append("CAMPOS QUE SE LLENARÍAN EN EXCEL")
+
+            if codigo:
+                excel_data = self.get_excel_equipo_by_codigo(codigo)
+                if excel_data:
+                    rows = self.build_fill_preview_rows_existing(excel_data, doc_data)
+                    report.append("Modo: actualizar registro existente")
+                else:
+                    rows = self.build_fill_preview_rows_new(doc_data)
+                    report.append("Modo: crear nuevo registro (código detectado no existe)")
+            else:
+                rows = self.build_fill_preview_rows_new(doc_data)
+                report.append("Modo: crear nuevo registro con código automático")
+
+            if rows:
+                for field_label, excel_current, new_value in rows:
+                    report.append(f"- {field_label}: {excel_current} -> {new_value}")
+            else:
+                report.append("- No hay campos nuevos para llenar.")
+
+            self.set_compare_result("\n".join(report))
+
+        except Exception as exc:
+            messagebox.showwarning(
+                "Vista previa",
+                f"No se pudo generar vista previa:\n{exc}"
+            )
+
+    def show_preview_only_window(self, title, rows, info_text=""):
+        """Mostrar mini excel solo informativo al cargar hoja de vida."""
+        preview = ctk.CTkToplevel(self.root)
+        preview.title(title)
+        preview.geometry("900x430")
+        preview.transient(self.root)
+        preview.grab_set()
+
+        preview.update_idletasks()
+        x = (preview.winfo_screenwidth() // 2) - 450
+        y = (preview.winfo_screenheight() // 2) - 215
+        preview.geometry(f"900x430+{x}+{y}")
+
+        ctk.CTkLabel(
+            preview,
+            text="🧾 Vista previa automática (mini excel)",
+            font=("Segoe UI", 15, "bold")
+        ).pack(pady=(14, 8))
+
+        if info_text:
+            ctk.CTkLabel(
+                preview,
+                text=info_text,
+                font=("Segoe UI", 11)
+            ).pack(pady=(0, 8))
+
+        container = ctk.CTkFrame(preview, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=16, pady=8)
+
+        cols = ("campo", "excel", "nuevo")
+        tree = ttk.Treeview(container, columns=cols, show="headings", height=12)
+        tree.heading("campo", text="Campo")
+        tree.heading("excel", text="Excel actual")
+        tree.heading("nuevo", text="Valor detectado")
+        tree.column("campo", width=250, anchor="w")
+        tree.column("excel", width=180, anchor="w")
+        tree.column("nuevo", width=430, anchor="w")
+
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        if rows:
+            for row in rows:
+                tree.insert("", "end", values=row)
+        else:
+            tree.insert("", "end", values=("(sin cambios detectados)", "", ""))
+
+        ctk.CTkButton(
+            preview,
+            text="Cerrar",
+            command=preview.destroy,
+            fg_color=COLOR_VERDE_HOSPITAL,
+            hover_color="#1F5039",
+            width=120
+        ).pack(pady=(6, 14))
+
+        preview.wait_window()
+
+    def preview_docx_fill_plan(self, docx_path):
+        """Mostrar mini excel automáticamente al cargar hoja de vida."""
+        try:
+            full_text, lines = read_docx_text(docx_path)
+            doc_data = self.extract_hoja_vida_data(full_text, lines)
+
+            detected_codigo = ""
+            match_codigo = re.search(r"\bEQC-\d{4,5}\b", full_text, flags=re.IGNORECASE)
+            if match_codigo:
+                detected_codigo = match_codigo.group(0).upper()
+
+            codigo = detected_codigo or (doc_data.get("codigo", "") or "").strip().upper()
+
+            if codigo:
+                excel_data = self.get_excel_equipo_by_codigo(codigo)
+                if excel_data:
+                    rows = self.build_fill_preview_rows_existing(excel_data, doc_data)
+                    info = f"Código detectado: {codigo} (registro existente)"
+                    self.show_preview_only_window("Mini Excel - Campos a completar", rows, info)
+                else:
+                    rows = self.build_fill_preview_rows_new(doc_data)
+                    info = f"Código detectado: {codigo} (se creará nuevo registro)"
+                    self.show_preview_only_window("Mini Excel - Campos detectados", rows, info)
+            else:
+                rows = self.build_fill_preview_rows_new(doc_data)
+                info = "Sin código detectado (se usará código automático al crear)."
+                self.show_preview_only_window("Mini Excel - Campos detectados", rows, info)
+
+        except Exception as exc:
+            messagebox.showwarning(
+                "Vista previa",
+                f"No se pudo generar vista previa automática:\n{exc}"
+            )
+
+    def load_equipo_into_form_by_codigo(self, codigo, show_ready_message=True):
+        """Cargar equipo por código en el formulario principal en modo actualización."""
+        if not self.excel_path:
+            return False, "No hay Excel cargado"
+
+        wb = None
+        try:
+            wb = load_workbook(self.excel_path)
+            ws = wb["Equipos de Cómputo"]
+
+            target_row = None
+            for row in range(2, 5000):
+                cell_value = ws.cell(row=row, column=2).value
+                if cell_value and str(cell_value).strip().upper() == codigo:
+                    target_row = row
+                    break
+
+            if not target_row:
+                return False, f"No se encontró el código {codigo}"
+
+            naranja_map = {
+                4: 'tipo_equipo', 5: 'area_servicio', 6: 'ubicacion_especifica',
+                7: 'responsable_custodio', 8: 'macroproceso', 9: 'proceso',
+                10: 'subproceso', 11: 'uso_sihos', 12: 'uso_office_basico',
+                13: 'software_especializado', 14: 'descripcion_software',
+                15: 'funcion_principal', 34: 'horario_uso', 35: 'estado_operativo',
+                36: 'observaciones_tecnicas', 37: 'periodicidad_mtto', 38: 'responsable_mtto'
+            }
+
+            for i in range(1, 10):
+                naranja_map[15 + i] = f'conf_{i}'
+            for i in range(1, 4):
+                naranja_map[24 + i] = f'int_{i}'
+            for i in range(1, 7):
+                naranja_map[27 + i] = f'crit_{i}'
+
+            verde_map = {
+                39: 'marca', 40: 'modelo', 41: 'serial',
+                42: 'sistema_operativo', 43: 'arquitectura_so', 44: 'procesador', 45: 'ram_gb',
+                46: 'disco1_capacidad', 47: 'disco1_tipo', 48: 'disco1_serial',
+                49: 'disco1_marca', 50: 'disco1_modelo',
+                51: 'disco2_capacidad', 52: 'disco2_tipo', 53: 'disco2_serial',
+                54: 'disco2_marca', 55: 'disco2_modelo',
+                56: 'uso_navegador_web', 57: 'version_office', 58: 'licencia_office',
+                59: 'uso_teams', 60: 'uso_outlook',
+                61: 'licencia_windows', 62: 'key_windows', 63: 'estado_licencia_windows',
+                64: 'direccion_ip', 65: 'mac_address', 66: 'tipo_conexion',
+                67: 'navegador_predeterminado', 68: 'unidades_red_mapeadas',
+                69: 'antivirus_instalado', 70: 'ultima_act_windows', 71: 'windows_update_activo',
+                79: 'velocidad_red',
+                80: 'tpm_status', 81: 'bitlocker_status', 82: 'cpu_nucleos',
+                83: 'cpu_uso_actual', 84: 'ram_uso_actual'
+            }
+
+            azul_map = {
+                72: 'switch_puerto', 73: 'vlan_asignada', 74: 'id_anydesk',
+                75: 'otro_acceso_remoto', 76: 'estado_antivirus',
+                77: 'cifrado_disco', 78: 'tipo_usuario_local'
+            }
+
+            self.equipment_data = {}
+            self.verde_data = {}
+            self.azul_data = {}
+
+            for col, field_name in naranja_map.items():
+                value = ws.cell(row=target_row, column=col).value or ''
+                self.equipment_data[field_name] = value
+
+            for col, field_name in verde_map.items():
+                value = ws.cell(row=target_row, column=col).value or ''
+                self.verde_data[field_name] = value
+
+            for col, field_name in azul_map.items():
+                value = ws.cell(row=target_row, column=col).value or ''
+                self.azul_data[field_name] = value
+
+            for field_name, value in self.equipment_data.items():
+                if field_name in self.manual_widgets:
+                    try:
+                        widget = self.manual_widgets[field_name]
+                        if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
+                            if isinstance(widget, ctk.CTkEntry):
+                                widget.delete(0, "end")
+                                widget.insert(0, value)
+                            elif isinstance(widget, ctk.CTkComboBox):
+                                widget.set(value)
+                        elif isinstance(widget, tk.StringVar):
+                            widget.set(value)
+                    except Exception:
+                        pass
+
+            self.equipo_update_code = codigo
+            self.equipo_update_row = target_row
+
+            if hasattr(self, 'equipo_form_frame'):
+                try:
+                    if hasattr(self.equipo_form_frame, 'winfo_exists') and self.equipo_form_frame.winfo_exists():
+                        self.equipo_form_frame.configure(label_text=f"🔄 ACTUALIZANDO - Código: {codigo}")
+                except Exception:
+                    pass
+
+            if hasattr(self, 'form_title_label'):
+                try:
+                    if hasattr(self.form_title_label, 'winfo_exists') and self.form_title_label.winfo_exists():
+                        self.form_title_label.configure(text=f"🔄 ACTUALIZANDO EQUIPO - Código: {codigo}")
+                except Exception:
+                    pass
+
+            if hasattr(self, 'btn_save_equipo'):
+                try:
+                    if hasattr(self.btn_save_equipo, 'winfo_exists') and self.btn_save_equipo.winfo_exists():
+                        self.btn_save_equipo.configure(text="🔄 ACTUALIZAR EQUIPO")
+                except Exception:
+                    pass
+
+            if show_ready_message:
+                messagebox.showinfo("Listo", f"✅ Datos cargados de {codigo}\n\nModifica los campos y presiona ACTUALIZAR EQUIPO.")
+
+            return True, "ok"
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            if wb:
+                wb.close()
+
+    def extract_hoja_vida_data(self, full_text, lines):
+        """Extraer valores de hoja de vida usando patrones comunes."""
+        cpu_marca, cpu_modelo, cpu_serial = extract_cpu_component_fields(lines)
+
+        return {
+            "codigo": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\bcodigo\s*(?:del\s*equipo)?\s*[:\-]\s*(EQC-\d{4,5})\b", r"(?im)\b(EQC-\d{4,5})\b"],
+                ["codigo", "codigo equipo", "codigo del equipo"],
+            ),
+            "nombre_equipo": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\bnombre\s*(?:del\s*equipo)?\s*[:\-]\s*([^\n\r]+)", r"(?im)\bhostname\s*[:\-]\s*([^\n\r]+)"],
+                ["nombre equipo", "nombre del equipo", "hostname"],
+            ),
+            "tipo_equipo": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\btipo\s*de\s*equipo\s*[:\-]\s*([^\n\r]+)"],
+                ["tipo de equipo"],
+            ),
+            "area_servicio": extract_value_from_doc(
+                full_text,
+                lines,
+                [
+                    r"(?im)\b[aá]rea\s*asignada\s*(?::|\-|\s+)\s*([^\n\r]+)",
+                    r"(?im)\b[aá]rea\s*(?:\/|y)?\s*servicio\s*(?::|\-|\s+)\s*([^\n\r]+)",
+                    r"(?im)\bservicio\s*(?::|\-|\s+)\s*([^\n\r]+)",
+                    r"(?im)\bdependencia\s*(?::|\-)\s*([^\n\r]+)",
+                ],
+                ["area / servicio", "area servicio", "servicio"],
+            ) or extract_value_by_label(
+                lines,
+                ["Área Asignada", "Area Asignada", "Área / Servicio", "Area / Servicio", "Área Servicio", "Area Servicio", "Servicio", "Dependencia"],
+            ),
+            "ubicacion_especifica": extract_value_from_doc(
+                full_text,
+                lines,
+                [
+                    r"(?im)\bubicaci[oó]n\s*espec[ií]fica\s*(?::|\-)\s*([^\n\r]+)",
+                    r"(?im)\bubicaci[oó]n\s*f[ií]sica\s*(?::|\-)\s*([^\n\r]+)",
+                ],
+                ["ubicacion", "ubicacion especifica"],
+            ) or extract_value_by_label(
+                lines,
+                ["Ubicación Específica", "Ubicacion Especifica", "Ubicación", "Ubicacion", "Ubicación Física", "Ubicacion Fisica"],
+            ),
+            "responsable_custodio": extract_value_from_doc(
+                full_text,
+                lines,
+                [
+                    r"(?im)\bcoordinador\s*[aá]rea\s*(?::|\-|\s+)\s*([^\n\r]+)",
+                    r"(?im)\b(?:responsable|custodio)\s*(?::|\-|\s+)\s*([^\n\r]+)",
+                    r"(?im)\bresponsable\s*del\s*equipo\s*(?::|\-|\s+)\s*([^\n\r]+)",
+                    r"(?im)\bfuncionario\s*responsable\s*(?::|\-|\s+)\s*([^\n\r]+)",
+                ],
+                ["responsable", "custodio", "responsable / custodio"],
+            ) or extract_value_by_label(
+                lines,
+                ["Coordinador Área", "Coordinador Area", "Responsable", "Custodio", "Responsable / Custodio", "Responsable del Equipo", "Funcionario Responsable"],
+            ),
+            "marca": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\bmarca\s*[:\-]\s*([^\n\r]+)"],
+            ) if not cpu_marca else cpu_marca,
+            "modelo": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\bmodelo\s*[:\-]\s*([^\n\r]+)"],
+            ) if not cpu_modelo else cpu_modelo,
+            "serial": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\bserial\s*(?:number|no\.?|nro\.?|#)?\s*[:\-]\s*([^\n\r]+)"],
+            ) if not cpu_serial else cpu_serial,
+            "sistema_operativo": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\b(?:sistema\s*operativo|so)\s*[:\-]\s*([^\n\r]+)"],
+                ["sistema operativo", "so"],
+            ),
+            "procesador": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\b(?:procesador|cpu)\s*[:\-]\s*([^\n\r]+)"],
+                ["procesador", "cpu"],
+            ),
+            "ram_gb": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\bram\s*(?:instalada)?\s*[:\-]\s*([^\n\r]+)", r"(?im)\bmemoria\s*ram\s*[:\-]\s*([^\n\r]+)"],
+                ["ram", "ram instalada", "memoria ram"],
+            ),
+            "disco1_capacidad": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\b(?:disco\s*1\s*capacidad|capacidad\s*disco\s*1|almacenamiento)\s*[:\-]\s*([^\n\r]+)"],
+                ["disco 1 capacidad", "capacidad disco 1", "almacenamiento"],
+            ),
+            "direccion_ip": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\b(?:direccion\s*ip|ip)\s*[:\-]\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})"],
+                ["direccion ip", "ip"],
+            ),
+            "mac_address": extract_value_from_doc(
+                full_text,
+                lines,
+                [r"(?im)\b(?:mac\s*(?:address)?|direccion\s*mac)\s*[:\-]\s*([0-9A-Fa-f:\-]{12,17})"],
+                ["mac", "mac address", "direccion mac"],
+            ),
+        }
+
+    def values_match_for_field(self, field_name, excel_value, doc_value):
+        """Comparar valores de Excel vs hoja de vida según tipo de campo."""
+        excel_raw = str(excel_value or "").strip()
+        doc_raw = str(doc_value or "").strip()
+
+        if not doc_raw:
+            return False
+        if not excel_raw:
+            return False
+
+        if field_name in {"serial", "mac_address"}:
+            return normalize_alnum(excel_raw) == normalize_alnum(doc_raw)
+
+        if field_name in {"ram_gb", "disco1_capacidad"}:
+            return extract_first_number(excel_raw) == extract_first_number(doc_raw)
+
+        return normalize_text_for_compare(excel_raw) == normalize_text_for_compare(doc_raw)
+
+    def run_hoja_vida_excel_comparison(self):
+        """Ejecutar comparación entre hoja de vida (.docx) y fila del Excel."""
+        docx_path = (getattr(self, "hoja_vida_docx_path", "") or "").strip()
+        if not docx_path:
+            messagebox.showwarning("Comparador", "Primero selecciona la hoja de vida (.docx).")
+            return
+
+        if not os.path.exists(docx_path):
+            messagebox.showerror("Comparador", "El archivo seleccionado ya no existe.")
+            return
+
+        try:
+            full_text, lines = read_docx_text(docx_path)
+        except Exception as exc:
+            messagebox.showerror("Comparador", f"No se pudo leer el archivo .docx:\n{exc}")
+            return
+
+        detected_codigo = ""
+        match_codigo = re.search(r"\bEQC-\d{4,5}\b", full_text, flags=re.IGNORECASE)
+        if match_codigo:
+            detected_codigo = match_codigo.group(0).upper()
+
+        doc_data = self.extract_hoja_vida_data(full_text, lines)
+        codigo = detected_codigo or (doc_data.get("codigo", "") or "").strip().upper()
+
+        if not codigo:
+            create_without_code = messagebox.askyesno(
+                "Comparador",
+                "No se detectó código EQC-xxxx en la hoja de vida.\n\n"
+                "¿Quieres crear el equipo con código automático y completar faltantes en inicio?"
+            )
+            if not create_without_code:
+                return
+
+            preview_rows = self.build_fill_preview_rows_new(doc_data)
+            if not self.show_fill_preview_window("Campos a crear en Excel", preview_rows):
+                return
+
+            new_code, filled_count = self.create_new_equipo_from_doc_data(doc_data)
+            if not new_code:
+                messagebox.showerror("Comparador", "No fue posible crear el equipo en Excel.")
+                return
+
+            self.show_manual_form_in_container()
+            loaded_ok, load_msg = self.load_equipo_into_form_by_codigo(new_code, show_ready_message=False)
+            if not loaded_ok:
+                messagebox.showwarning(
+                    "Equipo creado",
+                    f"Se creó el equipo {new_code} con {filled_count} campos iniciales,\n"
+                    f"pero no se pudo cargar en el formulario:\n{load_msg}"
+                )
+                return
+
+            messagebox.showinfo(
+                "Equipo creado",
+                f"✅ Equipo {new_code} creado desde hoja de vida.\n"
+                f"Campos iniciales cargados: {filled_count}.\n\n"
+                "Ya estás en inicio para completar los campos faltantes y guardar actualización."
+            )
+            return
+
+        excel_data = self.get_excel_equipo_by_codigo(codigo)
+        if not excel_data:
+            create_with_detected_code = messagebox.askyesno(
+                "Comparador",
+                f"El código {codigo} no existe en Excel.\n\n"
+                "¿Deseas crear el equipo con los datos detectados y luego completar faltantes?"
+            )
+            if not create_with_detected_code:
+                return
+
+            preview_rows = self.build_fill_preview_rows_new(doc_data)
+            if not self.show_fill_preview_window("Campos a crear en Excel", preview_rows):
+                return
+
+            new_code, filled_count = self.create_new_equipo_from_doc_data(doc_data, forced_codigo=codigo)
+            if not new_code:
+                messagebox.showerror("Comparador", "No fue posible crear el equipo en Excel.")
+                return
+
+            self.show_manual_form_in_container()
+            loaded_ok, load_msg = self.load_equipo_into_form_by_codigo(new_code, show_ready_message=False)
+            if not loaded_ok:
+                messagebox.showwarning(
+                    "Equipo creado",
+                    f"Se creó el equipo {new_code} con {filled_count} campos iniciales,\n"
+                    f"pero no se pudo cargar en el formulario:\n{load_msg}"
+                )
+                return
+
+            messagebox.showinfo(
+                "Equipo creado",
+                f"✅ Equipo {new_code} creado desde hoja de vida.\n"
+                f"Campos iniciales cargados: {filled_count}.\n\n"
+                "Ya estás en inicio para completar los campos faltantes y guardar actualización."
+            )
+            return
+
+        if not doc_data.get("codigo"):
+            doc_data["codigo"] = codigo
+
+        fields_to_compare = [
+            ("codigo", "Código"),
+            ("nombre_equipo", "Nombre Equipo"),
+            ("tipo_equipo", "Tipo de Equipo"),
+            ("area_servicio", "Área / Servicio"),
+            ("ubicacion_especifica", "Ubicación Específica"),
+            ("responsable_custodio", "Responsable / Custodio"),
+            ("marca", "Marca"),
+            ("modelo", "Modelo"),
+            ("serial", "Serial"),
+            ("sistema_operativo", "Sistema Operativo"),
+            ("procesador", "Procesador"),
+            ("ram_gb", "RAM (GB)"),
+            ("disco1_capacidad", "Disco 1 Capacidad"),
+            ("direccion_ip", "Dirección IP"),
+            ("mac_address", "MAC Address"),
+        ]
+
+        matches = 0
+        differences = 0
+        missing = 0
+        report_lines = []
+
+        report_lines.append("=" * 92)
+        report_lines.append("COMPARACIÓN HOJA DE VIDA vs EXCEL")
+        report_lines.append("=" * 92)
+        report_lines.append(f"Archivo: {os.path.basename(docx_path)}")
+        report_lines.append(f"Código comparado: {codigo}")
+        report_lines.append("")
+
+        for field_key, field_label in fields_to_compare:
+            excel_value = (excel_data.get(field_key) or "").strip()
+            doc_value = (doc_data.get(field_key) or "").strip()
+
+            if not doc_value:
+                status = "❓ NO ENCONTRADO EN HOJA DE VIDA"
+                missing += 1
+            elif self.values_match_for_field(field_key, excel_value, doc_value):
+                status = "✅ COINCIDE"
+                matches += 1
+            else:
+                status = "⚠️ DIFERENTE"
+                differences += 1
+
+            report_lines.append(f"{field_label}: {status}")
+            report_lines.append(f"  Excel: {excel_value if excel_value else '(vacío)'}")
+            report_lines.append(f"  Hoja : {doc_value if doc_value else '(no encontrado)'}")
+            report_lines.append("-" * 92)
+
+        report_lines.append("")
+        report_lines.append("RESUMEN")
+        report_lines.append(f"✅ Coinciden: {matches}")
+        report_lines.append(f"⚠️ Diferentes: {differences}")
+        report_lines.append(f"❓ No encontrados en hoja de vida: {missing}")
+
+        preview_rows = self.build_fill_preview_rows_existing(excel_data, doc_data)
+        if not self.show_fill_preview_window("Campos a completar en Excel", preview_rows):
+            self.set_compare_result("\n".join(report_lines + ["", "Acción cancelada por usuario antes de llenar Excel."]))
+            return
+
+        updated_count, updated_fields = self.fill_missing_excel_fields_from_doc(codigo, doc_data)
+        report_lines.append(f"🧩 Campos vacíos completados en Excel: {updated_count}")
+        if updated_fields:
+            report_lines.append("   " + ", ".join(updated_fields))
+
+        self.set_compare_result("\n".join(report_lines))
+
+        self.show_manual_form_in_container()
+        loaded_ok, load_msg = self.load_equipo_into_form_by_codigo(codigo, show_ready_message=False)
+        if loaded_ok:
+            messagebox.showinfo(
+                "Comparación finalizada",
+                f"✅ Equipo {codigo} procesado.\n"
+                f"Campos completados en Excel: {updated_count}\n\n"
+                "Ya estás en inicio con el equipo cargado para revisar y actualizar."
+            )
+        else:
+            messagebox.showwarning(
+                "Comparación finalizada",
+                f"Se completaron campos faltantes en Excel para {codigo},\n"
+                f"pero no se pudo cargar el formulario de actualización:\n{load_msg}"
+            )
     
     def show_classification_guide(self):
         """Mostrar guía de clasificación."""
@@ -1976,13 +4215,74 @@ class InventoryManagerApp:
     def detect_anydesk(self):
         """Detectar ID de AnyDesk si está instalado."""
         try:
-            # Ruta típica de AnyDesk
-            anydesk_path = r"C:\Program Files (x86)\AnyDesk\AnyDesk.exe"
-            if os.path.exists(anydesk_path):
-                # Intentar obtener ID (simplificado)
+            rutas_posibles = []
+
+            pf = os.environ.get("ProgramFiles")
+            pf86 = os.environ.get("ProgramFiles(x86)")
+            appdata = os.environ.get("APPDATA")
+            localappdata = os.environ.get("LOCALAPPDATA")
+
+            if pf:
+                rutas_posibles.append(os.path.join(pf, "AnyDesk", "AnyDesk.exe"))
+            if pf86:
+                rutas_posibles.append(os.path.join(pf86, "AnyDesk", "AnyDesk.exe"))
+            if appdata:
+                rutas_posibles.append(os.path.join(appdata, "AnyDesk", "AnyDesk.exe"))
+            if localappdata:
+                rutas_posibles.append(os.path.join(localappdata, "AnyDesk", "AnyDesk.exe"))
+
+            path_anydesk = shutil.which("AnyDesk.exe")
+            if path_anydesk:
+                rutas_posibles.append(path_anydesk)
+
+            instalado = any(os.path.exists(ruta) for ruta in rutas_posibles)
+
+            # Intentar extraer ID desde archivos de configuración típicos
+            archivos_config = []
+            programdata = os.environ.get("PROGRAMDATA")
+
+            if programdata:
+                archivos_config.extend([
+                    os.path.join(programdata, "AnyDesk", "service.conf"),
+                    os.path.join(programdata, "AnyDesk", "system.conf"),
+                ])
+            if appdata:
+                archivos_config.extend([
+                    os.path.join(appdata, "AnyDesk", "service.conf"),
+                    os.path.join(appdata, "AnyDesk", "system.conf"),
+                ])
+            if localappdata:
+                archivos_config.extend([
+                    os.path.join(localappdata, "AnyDesk", "service.conf"),
+                    os.path.join(localappdata, "AnyDesk", "system.conf"),
+                ])
+
+            patron_clave = re.compile(
+                r"(?i)(?:ad\.anynet\.id|anynet\.id|client_id)\s*=\s*\"?([0-9]{6,12})\"?"
+            )
+            patron_numerico = re.compile(r"\b([0-9]{6,12})\b")
+
+            for archivo in archivos_config:
+                if not os.path.exists(archivo):
+                    continue
+                try:
+                    with open(archivo, "r", encoding="utf-8", errors="ignore") as f:
+                        contenido = f.read()
+
+                    match = patron_clave.search(contenido)
+                    if match:
+                        return match.group(1)
+
+                    match_num = patron_numerico.search(contenido)
+                    if match_num:
+                        return match_num.group(1)
+                except:
+                    continue
+
+            if instalado:
                 return "Instalado - Verificar ID"
             return "No instalado"
-        except:
+        except Exception:
             return "No detectado"
     
     def save_mixed_and_excel(self, validation_window):
@@ -2112,7 +4412,7 @@ class InventoryManagerApp:
         
         # 1. Nombre del equipo
         self.log_progress("📋 Identificación del equipo...")
-        self.verde_data['nombre_equipo'] = socket.gethostname()
+        self.verde_data['nombre_equipo'] = detect_hostname_local()
         self.log_progress(f"   ✓ Nombre: {self.verde_data['nombre_equipo']}")
         
         # 2. Hardware con WMI
@@ -2158,10 +4458,12 @@ class InventoryManagerApp:
         self.verde_data['sistema_operativo'] = f"{platform.system()} {platform.release()}"
         self.verde_data['arquitectura_so'] = "64 bits" if "64" in platform.machine() else "32 bits"
         self.verde_data['procesador'] = platform.processor() or "No detectado"
+        self.verde_data['cpu_nucleos'] = detect_cpu_cores()
         
         self.log_progress(f"   ✓ SO: {self.verde_data['sistema_operativo']}")
         self.log_progress(f"   ✓ Arquitectura: {self.verde_data['arquitectura_so']}")
         self.log_progress(f"   ✓ Procesador: {self.verde_data['procesador'][:50]}...")
+        self.log_progress(f"   ✓ Núcleos CPU: {self.verde_data['cpu_nucleos']}")
         
         # 8-9. RAM y Almacenamiento
         if HAS_PSUTIL:
@@ -2269,25 +4571,37 @@ class InventoryManagerApp:
         self.verde_data['velocidad_red'] = velocidad_red
         self.log_progress(f"   ✓ Velocidad de red: {velocidad_red}")
         
+        # Uso actual de recursos
+        cpu_uso, ram_uso = detect_current_cpu_ram_usage()
+        self.verde_data['cpu_uso_actual'] = cpu_uso
+        self.verde_data['ram_uso_actual'] = ram_uso
+        self.log_progress(f"   ✓ Uso actual CPU: {cpu_uso}")
+        self.log_progress(f"   ✓ Uso actual RAM: {ram_uso}")
+
         # 24-26. Seguridad
         self.log_progress("\n🔒 Seguridad...")
-        self.verde_data['antivirus_instalado'] = "Windows Defender"
+        defender_status = detect_defender_status()
+        self.verde_data['antivirus_instalado'] = defender_status
+        self.verde_data['tpm_status'] = detect_tpm_status()
+        self.verde_data['bitlocker_status'] = detect_bitlocker_status()
         self.verde_data['windows_update_activo'] = "Sí"
         
         last_update = detect_last_windows_update()
         self.verde_data['ultima_act_windows'] = last_update
         
-        self.log_progress(f"   ✓ Antivirus: Windows Defender")
+        self.log_progress(f"   ✓ Defender: {defender_status}")
+        self.log_progress(f"   ✓ TPM: {self.verde_data['tpm_status']}")
+        self.log_progress(f"   ✓ BitLocker: {self.verde_data['bitlocker_status']}")
         self.log_progress(f"   ✓ Última actualización: {last_update}")
         
         self.log_progress("\n✅ Recopilación automática completada")
         
         # Cerrar ventana de progreso
         self.progress_bar.stop()
-        self.root.after(1000, lambda: self.progress_window.destroy())
+        self.root.after(800, lambda: self.progress_window.destroy())
         
         # Mostrar validación de campos mixtos
-        self.root.after(1500, self.show_mixed_validation)
+        self.root.after(1200, self.show_mixed_validation)
 
     def show_mixed_validation(self):
         """Mostrar ventana de validación de campos mixtos (AZULES)."""
@@ -2324,11 +4638,12 @@ class InventoryManagerApp:
         
         # Campos mixtos (SIN DISCO 2)
         self.mixed_widgets = {}
+        switch_puerto_detectado, vlan_detectada = detect_switch_and_vlan()
         
         mixed_fields = [
             # RED Y ACCESO REMOTO
-            ("Switch / Puerto", "switch_puerto", "entry", "No detectado"),
-            ("VLAN Asignada", "vlan_asignada", "entry", "No detectado"),
+            ("Switch / Puerto", "switch_puerto", "entry", switch_puerto_detectado),
+            ("VLAN Asignada", "vlan_asignada", "entry", vlan_detectada),
             ("ID AnyDesk", "id_anydesk", "entry", self.detect_anydesk()),
             ("Otro Acceso Remoto", "otro_acceso_remoto", "entry", "Ninguno"),
             
@@ -2474,6 +4789,11 @@ class InventoryManagerApp:
             ws.cell(row=row, column=70, value=self.verde_data.get('ultima_act_windows', ''))
             ws.cell(row=row, column=71, value=self.verde_data.get('windows_update_activo', ''))
             ws.cell(row=row, column=79, value=self.verde_data.get('velocidad_red', 'No detectado'))
+            ws.cell(row=row, column=80, value=self.verde_data.get('tpm_status', ''))
+            ws.cell(row=row, column=81, value=self.verde_data.get('bitlocker_status', ''))
+            ws.cell(row=row, column=82, value=self.verde_data.get('cpu_nucleos', ''))
+            ws.cell(row=row, column=83, value=self.verde_data.get('cpu_uso_actual', ''))
+            ws.cell(row=row, column=84, value=self.verde_data.get('ram_uso_actual', ''))
             
             # ===== ACTUALIZAR COLUMNAS 72-78: AZULES (datos mixtos) =====
             ws.cell(row=row, column=72, value=self.azul_data.get('switch_puerto', ''))
@@ -2486,7 +4806,7 @@ class InventoryManagerApp:
             
             wb.save(self.excel_path)
             wb.close()
-            
+
             messagebox.showinfo("Éxito", f"✅ Equipo {codigo} actualizado con datos automáticos")
             
             # Limpiar modo actualización
@@ -2639,11 +4959,16 @@ class InventoryManagerApp:
 
             # ===== COLUMNA 79: VELOCIDAD DE RED (VERDE - NUEVA) =====
             ws.cell(row=nueva_fila, column=79, value=self.verde_data.get('velocidad_red', ''))
+            ws.cell(row=nueva_fila, column=80, value=self.verde_data.get('tpm_status', ''))
+            ws.cell(row=nueva_fila, column=81, value=self.verde_data.get('bitlocker_status', ''))
+            ws.cell(row=nueva_fila, column=82, value=self.verde_data.get('cpu_nucleos', ''))
+            ws.cell(row=nueva_fila, column=83, value=self.verde_data.get('cpu_uso_actual', ''))
+            ws.cell(row=nueva_fila, column=84, value=self.verde_data.get('ram_uso_actual', ''))
             
             # Guardar
             wb.save(self.excel_path)
             wb.close()
-            
+
             print(f"✅ Guardado exitoso: {next_codigo} en fila {nueva_fila}")
             
             messagebox.showinfo("Éxito", f"✅ Equipo guardado: {next_codigo}\n\nDatos completos: 78 columnas")
@@ -2786,8 +5111,8 @@ class InventoryManagerApp:
             ws.cell(row=nueva_fila, column=1).value = next_consecutivo  # N° Consecutivo
             ws.cell(row=nueva_fila, column=2).value = next_codigo       # Código
             
-            # Col 3: Nombre Equipo (VERDE - se llenará después)
-            ws.cell(row=nueva_fila, column=3).value = ''  # Vacío por ahora
+            # Col 3: Nombre Equipo (VERDE - auto detección básica)
+            ws.cell(row=nueva_fila, column=3).value = detect_hostname_local()
             
             # Cols 4-10: Básicos (NARANJA)
             ws.cell(row=nueva_fila, column=4).value = datos_guardados.get('tipo_equipo', '')
@@ -2828,6 +5153,9 @@ class InventoryManagerApp:
             # Cols 39-71: Hardware/Software (VERDE) - Vacíos por ahora
             for col in range(39, 72):
                 ws.cell(row=nueva_fila, column=col).value = ''
+
+            # Cargar datos básicos automáticos aunque sea guardado manual
+            ws.cell(row=nueva_fila, column=64).value = detect_ip_local()
 
             # Cols 72-78: Mixtos (AZUL) - Vacíos por ahora
             for col in range(72, 79):
@@ -2921,137 +5249,13 @@ class InventoryManagerApp:
                 return
             
             try:
-                wb = load_workbook(self.excel_path)
-                ws = wb["Equipos de Cómputo"]
-                
-                found = False
-                target_row = None
-                
-                for row in range(2, 500):
-                    cell_value = ws.cell(row=row, column=2).value
-                    if cell_value and cell_value.upper() == codigo:
-                        found = True
-                        target_row = row
-                        break
-                
-                if not found:
-                    wb.close()
-                    messagebox.showerror("Error", f"No se encontró el código {codigo}")
+                loaded_ok, load_msg = self.load_equipo_into_form_by_codigo(codigo, show_ready_message=False)
+                if not loaded_ok:
+                    messagebox.showerror("Error", load_msg)
                     return
-                
-                # ===== CARGAR TODAS LAS COLUMNAS (NARANJAS + VERDES + AZULES) =====
-                
-                # NARANJAS (cols 4-38)
-                naranja_map = {
-                    4: 'tipo_equipo', 5: 'area_servicio', 6: 'ubicacion_especifica',
-                    7: 'responsable_custodio', 8: 'macroproceso', 9: 'proceso',
-                    10: 'subproceso', 11: 'uso_sihos', 12: 'uso_office_basico',
-                    13: 'software_especializado', 14: 'descripcion_software',
-                    15: 'funcion_principal', 34: 'horario_uso', 35: 'estado_operativo',
-                    36: 'observaciones_tecnicas', 37: 'periodicidad_mtto', 38: 'responsable_mtto'
-                }
-                
-                # Cuestionario (16-33)
-                for i in range(1, 10):  # CONFIDENCIALIDAD
-                    naranja_map[15 + i] = f'conf_{i}'
-                for i in range(1, 4):   # INTEGRIDAD
-                    naranja_map[24 + i] = f'int_{i}'
-                for i in range(1, 7):   # CRITICIDAD
-                    naranja_map[27 + i] = f'crit_{i}'
-                
-                # VERDES (cols 39-71 + 79)
-                verde_map = {
-                    39: 'marca', 40: 'modelo', 41: 'serial',
-                    42: 'sistema_operativo', 43: 'arquitectura_so', 44: 'procesador', 45: 'ram_gb',
-                    46: 'disco1_capacidad', 47: 'disco1_tipo', 48: 'disco1_serial',
-                    49: 'disco1_marca', 50: 'disco1_modelo',
-                    51: 'disco2_capacidad', 52: 'disco2_tipo', 53: 'disco2_serial',
-                    54: 'disco2_marca', 55: 'disco2_modelo',
-                    56: 'uso_navegador_web', 57: 'version_office', 58: 'licencia_office',
-                    59: 'uso_teams', 60: 'uso_outlook',
-                    61: 'licencia_windows', 62: 'key_windows', 63: 'estado_licencia_windows',
-                    64: 'direccion_ip', 65: 'mac_address', 66: 'tipo_conexion',
-                    67: 'navegador_predeterminado', 68: 'unidades_red_mapeadas',
-                    69: 'antivirus_instalado', 70: 'ultima_act_windows', 71: 'windows_update_activo',
-                    79: 'velocidad_red'
-                }
-                
-                # AZULES (cols 72-78)
-                azul_map = {
-                    72: 'switch_puerto', 73: 'vlan_asignada', 74: 'id_anydesk',
-                    75: 'otro_acceso_remoto', 76: 'estado_antivirus',
-                    77: 'cifrado_disco', 78: 'tipo_usuario_local'
-                }
-                
-                # Cargar datos en self.equipment_data, self.verde_data, self.azul_data
-                self.equipment_data = {}
-                self.verde_data = {}
-                self.azul_data = {}
-                
-                for col, field_name in naranja_map.items():
-                    value = ws.cell(row=target_row, column=col).value or ''
-                    self.equipment_data[field_name] = value
-                
-                for col, field_name in verde_map.items():
-                    value = ws.cell(row=target_row, column=col).value or ''
-                    self.verde_data[field_name] = value
-                
-                for col, field_name in azul_map.items():
-                    value = ws.cell(row=target_row, column=col).value or ''
-                    self.azul_data[field_name] = value
-                
-                # Cargar en widgets del formulario (solo NARANJAS visibles)
-                for field_name, value in self.equipment_data.items():
-                    if field_name in self.manual_widgets:
-                        try:
-                            widget = self.manual_widgets[field_name]
-                            if hasattr(widget, 'winfo_exists') and widget.winfo_exists():
-                                if isinstance(widget, ctk.CTkEntry):
-                                    widget.delete(0, "end")
-                                    widget.insert(0, value)
-                                elif isinstance(widget, ctk.CTkComboBox):
-                                    widget.set(value)
-                            elif isinstance(widget, tk.StringVar):
-                                widget.set(value)
-                        except:
-                            pass
-                
-                wb.close()
-                
-                self.equipo_update_code = codigo
-                self.equipo_update_row = target_row
-                
-                # CAMBIAR TÍTULO A MODO ACTUALIZACIÓN (con verificación)
-                # 1. Actualizar label del frame (gris)
-                if hasattr(self, 'equipo_form_frame'):
-                    try:
-                        if hasattr(self.equipo_form_frame, 'winfo_exists') and self.equipo_form_frame.winfo_exists():
-                            self.equipo_form_frame.configure(
-                                label_text=f"🔄 ACTUALIZANDO - Código: {codigo}"
-                            )
-                    except:
-                        pass
-                
-                # 2. Actualizar título verde
-                if hasattr(self, 'form_title_label'):
-                    try:
-                        if hasattr(self.form_title_label, 'winfo_exists') and self.form_title_label.winfo_exists():
-                            self.form_title_label.configure(
-                                text=f"🔄 ACTUALIZANDO EQUIPO - Código: {codigo}"
-                            )
-                    except:
-                        pass
-                
-                # CAMBIAR TEXTO DEL BOTÓN (con verificación)
-                if hasattr(self, 'btn_save_equipo'):
-                    try:
-                        if hasattr(self.btn_save_equipo, 'winfo_exists') and self.btn_save_equipo.winfo_exists():
-                            self.btn_save_equipo.configure(text="🔄 ACTUALIZAR EQUIPO")
-                    except:
-                        pass
-                
+
                 dialog.destroy()
-                
+
                 if messagebox.askyesno(
                     "Confirmar Actualización",
                     f"⚠️ ¿Estás seguro de actualizar {codigo}?\n\n"
@@ -3173,10 +5377,14 @@ class InventoryManagerApp:
                         pass
                 ws.cell(row=row, column=col, value=value)
                 col += 1
+
+            # Actualizar datos básicos de red/equipo en modo manual
+            ws.cell(row=row, column=3, value=detect_hostname_local())
+            ws.cell(row=row, column=64, value=detect_ip_local())
             
             wb.save(self.excel_path)
             wb.close()
-            
+
             messagebox.showinfo("Éxito", f"✅ Equipo {codigo} actualizado correctamente")
             
             # Reseteo completo usando función unificada
@@ -3480,7 +5688,7 @@ Nombre: {nombre}
                 self.imp_scroll.configure(label_text=f"🖨️ IMPRESORAS Y ESCÁNERES - Código: {next_code}")
                 
                 # Limpiar campos selectivamente (mantener área)
-                campos_a_mantener = ['area']
+                campos_a_mantener = ['area',"codigo_asignado","modelo","serial", "area", "ubicacion", "estado"]
                 
                 for key, widget in self.imp_widgets.items():
                     if key not in campos_a_mantener:
