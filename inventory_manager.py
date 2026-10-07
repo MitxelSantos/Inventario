@@ -1564,6 +1564,15 @@ class InventoryManagerApp:
         )
         menu_operaciones.add_separator()
         menu_operaciones.add_command(
+            label="Generar Hoja de Vida (formato oficial .docx)",
+            command=self.generar_hoja_vida_oficial
+        )
+        menu_operaciones.add_command(
+            label="Generar Reporte de Mantenimiento (formato oficial .pdf)",
+            command=self.abrir_dialogo_mantenimiento_pdf
+        )
+        menu_operaciones.add_separator()
+        menu_operaciones.add_command(
             label="Inventario Rápido (Externo)",
             command=self.launch_inventario_rapido
         )
@@ -2594,6 +2603,138 @@ class InventoryManagerApp:
             self.show_form_in_container(self.create_baja_form)
         elif tipo == "Comparar Hoja de Vida":
             self.show_form_in_container(self.create_hoja_vida_compare_form)
+
+    # ------------------------------------------------------------------
+    # FORMATOS OFICIALES (plantillas en carpeta "plantillas/")
+    # ------------------------------------------------------------------
+    def _abrir_archivo(self, ruta):
+        try:
+            if platform.system() == "Windows":
+                os.startfile(str(ruta))
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", str(ruta)])
+            else:
+                subprocess.Popen(["xdg-open", str(ruta)])
+        except Exception:
+            pass
+
+    def _pedir_codigo_equipo(self, titulo):
+        """Pide el código EQC-xxxx; propone el del equipo cargado en el formulario si existe."""
+        from tkinter import simpledialog
+        if not self.excel_path or not os.path.exists(self.excel_path):
+            messagebox.showwarning(titulo, "Primero carga o crea el archivo Excel del inventario.")
+            return ""
+        sugerido = getattr(self, "equipo_update_code", "") or ""
+        codigo = simpledialog.askstring(titulo, "Código del equipo (ej: EQC-0004):",
+                                        initialvalue=sugerido, parent=self)
+        return (codigo or "").strip().upper()
+
+    def generar_hoja_vida_oficial(self):
+        """Genera la hoja de vida (.docx) con la plantilla oficial."""
+        import generador_formatos as gf
+        codigo = self._pedir_codigo_equipo("Generar Hoja de Vida")
+        if not codigo:
+            return
+        try:
+            salida = gf.generar_hoja_vida(self.excel_path, codigo,
+                                          Path(self.excel_path).parent / "formatos_generados")
+        except Exception as e:
+            messagebox.showerror("Hoja de Vida", f"No se pudo generar la hoja de vida:\n\n{e}")
+            return
+        messagebox.showinfo("Hoja de Vida", f"Hoja de vida generada:\n{salida}")
+        self._abrir_archivo(salida)
+
+    def abrir_dialogo_mantenimiento_pdf(self):
+        """Diálogo para completar el reporte de mantenimiento preventivo (PDF oficial)."""
+        import generador_formatos as gf
+        codigo = self._pedir_codigo_equipo("Reporte de Mantenimiento")
+        if not codigo:
+            return
+        try:
+            gf.leer_equipo(self.excel_path, codigo)
+        except Exception as e:
+            messagebox.showerror("Reporte de Mantenimiento", str(e))
+            return
+
+        win = ctk.CTkToplevel(self)
+        win.title(f"Reporte de Mantenimiento Preventivo - {codigo}")
+        win.geometry("640x700")
+        win.transient(self)
+        frame = ctk.CTkScrollableFrame(win)
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        def campo(etiqueta, valor=""):
+            fila = ctk.CTkFrame(frame, fg_color="transparent")
+            fila.pack(fill="x", pady=2)
+            ctk.CTkLabel(fila, text=etiqueta, width=170, anchor="w").pack(side="left")
+            e = ctk.CTkEntry(fila)
+            e.pack(side="left", fill="x", expand=True)
+            e.insert(0, valor)
+            return e
+
+        hoy = datetime.now().strftime("%d/%m/%Y")
+        e_orden = campo("No. Orden")
+        e_prog = campo("Fecha programada (dd/mm/aaaa)", hoy)
+        e_ejec = campo("Fecha ejecución (dd/mm/aaaa)", hoy)
+        e_ini = campo("Hora inicio (HH:MM)", "08:00")
+        e_fin = campo("Hora finalización (HH:MM)", "08:30")
+
+        ctk.CTkLabel(frame, text="Checklist (por defecto: Cumple)",
+                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(10, 2))
+        actividades = [
+            "1. Condiciones ambientales", "2. Conexiones eléctricas y cables",
+            "3. Limpieza externa integral", "4. Limpieza interna del CPU",
+            "5. Componentes completos", "6. Funcionamiento del sistema operativo",
+            "7. Actualizaciones SO y software", "8. Estado del disco duro",
+            "9. Antivirus institucional", "10. Conectividad de red e impresoras",
+        ]
+        opciones = {"Cumple": "cumple", "No cumple": "no_cumple", "N/A": "na"}
+        combos = []
+        for act in actividades:
+            fila = ctk.CTkFrame(frame, fg_color="transparent")
+            fila.pack(fill="x", pady=1)
+            ctk.CTkLabel(fila, text=act, width=300, anchor="w").pack(side="left")
+            cb = ctk.CTkComboBox(fila, values=list(opciones.keys()), width=130, state="readonly")
+            cb.set("Cumple")
+            cb.pack(side="left")
+            combos.append(cb)
+
+        ctk.CTkLabel(frame, text="Materiales / repuestos (opcional)",
+                     font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(10, 2))
+        e_mat = campo("Material")
+        e_desc = campo("Descripción")
+        e_cant = campo("Cantidad")
+        ctk.CTkLabel(frame, text="Observaciones y hallazgos").pack(anchor="w", pady=(10, 0))
+        t_obs = ctk.CTkTextbox(frame, height=70)
+        t_obs.pack(fill="x")
+        ctk.CTkLabel(frame, text="Seguimiento y acciones requeridas").pack(anchor="w", pady=(8, 0))
+        t_seg = ctk.CTkTextbox(frame, height=70)
+        t_seg.pack(fill="x")
+
+        def generar():
+            materiales = []
+            if e_mat.get().strip():
+                materiales.append((e_mat.get().strip(), e_desc.get().strip(), e_cant.get().strip()))
+            try:
+                salida = gf.generar_mantenimiento_pdf(
+                    self.excel_path, codigo, Path(self.excel_path).parent / "formatos_generados",
+                    numero_orden=e_orden.get().strip(),
+                    fecha_programada=e_prog.get().strip(),
+                    fecha_ejecucion=e_ejec.get().strip(),
+                    hora_inicio=e_ini.get().strip(), hora_fin=e_fin.get().strip(),
+                    checklist=[opciones[c.get()] for c in combos],
+                    materiales=materiales,
+                    observaciones=t_obs.get("1.0", "end").strip(),
+                    seguimiento=t_seg.get("1.0", "end").strip(),
+                )
+            except Exception as e:
+                messagebox.showerror("Reporte de Mantenimiento", f"No se pudo generar el PDF:\n\n{e}", parent=win)
+                return
+            messagebox.showinfo("Reporte de Mantenimiento", f"PDF generado:\n{salida}", parent=win)
+            self._abrir_archivo(salida)
+            win.destroy()
+
+        ctk.CTkButton(win, text="📄 Generar PDF", command=generar, height=38).pack(pady=8)
 
     def create_hoja_vida_compare_form(self, parent):
         """Crear sección para comparar hoja de vida (.docx) contra registro en Excel."""

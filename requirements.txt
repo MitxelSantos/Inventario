@@ -7,3 +7,6 @@ python-dateutil>=2.8.0
 psutil>=5.9.0
 wmi>=1.5.1; platform_system == "Windows"
 pywin32>=305; platform_system == "Windows"
+python-docx>=1.1.0
+pypdf>=4.0.0
+reportlab>=4.0.0

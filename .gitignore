@@ -56,3 +56,6 @@ inventario_hospital_v1*.xlsx
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Formatos generados (contienen datos del inventario)
+formatos_generados/
